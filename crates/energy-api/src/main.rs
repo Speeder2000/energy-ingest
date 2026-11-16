@@ -20,10 +20,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if docs && !address.ip().is_loopback() {
         return Err("developer docs require a loopback listener".into());
     }
+    // Interval resolution of stream and window responses when a client
+    // does not request one: "native" (default) or "hour".
+    let resolution = match env::var("ENGY_API_DEFAULT_RESOLUTION") {
+        Ok(value) => energy_store::Resolution::parse(&value).ok_or(
+            "ENGY_API_DEFAULT_RESOLUTION must be \"native\" or \"hour\"",
+        )?,
+        Err(_) => energy_store::Resolution::Native,
+    };
     let app = if docs {
-        energy_api::developer_router(pool)
+        energy_api::developer_router_with_resolution(pool, resolution)
     } else {
-        energy_api::router(pool)
+        energy_api::router_with_resolution(pool, resolution)
     };
     axum::serve(listener, app).await?;
     Ok(())

@@ -87,6 +87,9 @@ pub use retrieval_coverage::{
     get_retrieval_coverage_revision, list_retrieval_gaps,
 };
 
+mod resolution;
+pub use resolution::{Resolution, aggregate_hourly};
+
 mod window_fingerprint;
 pub use window_fingerprint::window_fingerprint;
 

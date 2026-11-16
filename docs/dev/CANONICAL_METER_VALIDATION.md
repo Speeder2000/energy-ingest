@@ -54,6 +54,20 @@ flows, such as net (`flowDirection` 20), still raise
 `400 invalid_flow`. Delivered fingerprints are unchanged from before flows
 were introduced; received fingerprints are distinct.
 
+### Resolution (interval presentation)
+
+`stream` and `window` accept `?resolution=native|hour`, and responses echo
+`resolution`. `hour` sums sub-hour intervals into complete UTC hours, which
+is lossless for energy totals; an hour not fully covered by contiguous
+readings is omitted, never estimated. Intervals of an hour or longer are
+unchanged. The hourly value carries the newest contributing
+`accepted_revision_id`. The default is `native`, or the server's
+`ENGY_API_DEFAULT_RESOLUTION` (the all-in-one image sets `hour`, because
+the Home Assistant integration accepts only hourly electricity).
+Validation, candidate counts and fingerprints, including
+`window_fingerprint`, always describe the source intervals. An invalid
+value returns `400 invalid_resolution`.
+
 An empty stream is **not** a successful historical validation.
 A validation success is scoped to the observations currently attached;
 this summary does not claim that meter coverage is complete or gap-free.

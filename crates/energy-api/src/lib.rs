@@ -14,8 +14,8 @@ use axum::{
 use chrono::NaiveDateTime;
 use energy_store::{
     AcquisitionSourceId, AssociationError, AssociationOutcome, EnergyFlow,
-    HistoryWindow, MAX_WINDOW_CANDIDATES, StoreError, authenticate_api_token,
-    create_ingestion_run, get_acquisition_source,
+    HistoryWindow, MAX_WINDOW_CANDIDATES, Resolution, StoreError,
+    authenticate_api_token, create_ingestion_run, get_acquisition_source,
     import_gb_document_atomic_with_hash, physical_meter_flow,
     plan_history_refresh, resolve_meter_flow_window,
     resolve_physical_meter_flow_stream, summarize_meter_flow_validation,
@@ -31,6 +31,8 @@ use utoipa_swagger_ui::SwaggerUi;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: Pool<MySql>,
+    /// Interval resolution of `stream` and `window` when none is requested.
+    pub default_resolution: Resolution,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -77,6 +79,46 @@ impl FlowQuery {
                 physical_meter_flow(pool, meter).await.map_err(store_failure)
             }
         }
+    }
+}
+
+/// Optional interval resolution: `native` (as supplied by the utility) or
+/// `hour` (sub-hour intervals summed into complete UTC hours). Omitted
+/// means the server default (`ENGY_API_DEFAULT_RESOLUTION`).
+#[derive(Deserialize, Default)]
+struct ResolutionQuery {
+    resolution: Option<String>,
+}
+
+impl ResolutionQuery {
+    fn resolve(&self, default: Resolution) -> Result<Resolution, ApiError> {
+        match self.resolution.as_deref() {
+            None => Ok(default),
+            Some(value) => Resolution::parse(value).ok_or_else(|| {
+                failure(StatusCode::BAD_REQUEST, "invalid_resolution")
+            }),
+        }
+    }
+}
+
+/// Query of the interval-returning `stream` endpoint.
+#[derive(Deserialize, Default)]
+struct StreamQuery {
+    #[serde(flatten)]
+    flow: FlowQuery,
+    #[serde(flatten)]
+    resolution: ResolutionQuery,
+}
+
+fn interval_response(item: energy_store::SelectedInterval) -> IntervalResponse {
+    IntervalResponse {
+        start_utc: item.start.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        duration_seconds: item.duration_seconds,
+        raw_value: item.raw_value,
+        meter_reading_id: item.meter_reading_id,
+        accepted_revision_id: item.accepted_revision_id,
+        power_of_ten_multiplier: item.power_of_ten_multiplier,
+        unit_of_measure: item.unit_of_measure,
     }
 }
 
@@ -345,6 +387,8 @@ struct StreamResponse {
     physical_meter_id: u64,
     /// `delivered` (consumption) or `received` (export).
     flow: &'static str,
+    /// `native` or `hour`; see the `resolution` query parameter.
+    resolution: &'static str,
     candidate_count: usize,
     resolved: bool,
     intervals: Vec<IntervalResponse>,
@@ -431,11 +475,15 @@ async fn validation(
         ("flow" = Option<String>, Query,
          description = "`delivered` or `received` (export); \
                         defaults to the meter's flow"),
+        ("resolution" = Option<String>, Query,
+         description = "`native` or `hour` (complete UTC hours only); \
+                        defaults to the server setting"),
     ),
     responses(
         (status = 200, description = "Selected intervals or conflicts",
          body = StreamResponse),
-        (status = 400, description = "Invalid flow", body = ErrorBody),
+        (status = 400, description = "Invalid flow or resolution",
+         body = ErrorBody),
         (status = 401, description = "Invalid or absent bearer token",
          body = ErrorBody),
         (status = 404, description = "Meter not found", body = ErrorBody),
@@ -447,27 +495,20 @@ async fn validation(
 async fn stream(
     State(state): State<AppState>,
     Path(id): Path<u64>,
-    Query(flow): Query<FlowQuery>,
+    Query(query): Query<StreamQuery>,
     headers: HeaderMap,
 ) -> Result<Json<StreamResponse>, ApiError> {
     require_auth(&state.pool, &headers).await?;
-    let flow = flow.resolve(&state.pool, id).await?;
+    let resolution = query.resolution.resolve(state.default_resolution)?;
+    let flow = query.flow.resolve(&state.pool, id).await?;
     let selected = resolve_physical_meter_flow_stream(&state.pool, id, flow)
         .await
         .map_err(store_failure)?;
     let resolved = selected.issues.is_empty();
-    let intervals = selected
-        .intervals
+    let intervals = resolution
+        .apply(selected.intervals)
         .into_iter()
-        .map(|item| IntervalResponse {
-            start_utc: item.start.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            duration_seconds: item.duration_seconds,
-            raw_value: item.raw_value,
-            meter_reading_id: item.meter_reading_id,
-            accepted_revision_id: item.accepted_revision_id,
-            power_of_ten_multiplier: item.power_of_ten_multiplier,
-            unit_of_measure: item.unit_of_measure,
-        })
+        .map(interval_response)
         .collect();
     let issues = selected
         .issues
@@ -481,6 +522,7 @@ async fn stream(
     Ok(Json(StreamResponse {
         physical_meter_id: id,
         flow: flow.as_str(),
+        resolution: resolution.as_str(),
         candidate_count: selected.candidate_count,
         resolved,
         intervals,
@@ -496,6 +538,8 @@ struct WindowQuery {
     end: String,
     #[serde(flatten)]
     flow: FlowQuery,
+    #[serde(flatten)]
+    resolution: ResolutionQuery,
 }
 
 fn parse_window(
@@ -528,10 +572,13 @@ fn parse_window(
         ("flow" = Option<String>, Query,
          description = "`delivered` or `received` (export); \
                         defaults to the meter's flow"),
+        ("resolution" = Option<String>, Query,
+         description = "`native` or `hour` (complete UTC hours only); \
+                        defaults to the server setting"),
     ),
     responses(
         (status = 200, description = "Resolved window", body = StreamResponse),
-        (status = 400, description = "Invalid UTC range or flow",
+        (status = 400, description = "Invalid UTC range, flow or resolution",
          body = ErrorBody),
         (status = 401, description = "Bearer token required", body = ErrorBody),
         (status = 404, description = "Meter not found", body = ErrorBody),
@@ -548,6 +595,7 @@ async fn window(
 ) -> Result<Json<StreamResponse>, ApiError> {
     require_auth(&state.pool, &headers).await?;
     let (start, end) = parse_window(&query)?;
+    let resolution = query.resolution.resolve(state.default_resolution)?;
     let flow = query.flow.resolve(&state.pool, id).await?;
     let selected = resolve_meter_flow_window(&state.pool, id, start, end, flow)
         .await
@@ -560,23 +608,18 @@ async fn window(
         return Err(failure(StatusCode::CONFLICT, "unresolved_stream"));
     }
     let count = selected.candidate_count;
+    // The fingerprint identifies the source intervals, so it matches the
+    // history plan's fingerprint whatever the presentation resolution.
     let fingerprint = window_fingerprint(id, start, end, &selected.intervals);
-    let intervals = selected
-        .intervals
+    let intervals = resolution
+        .apply(selected.intervals)
         .into_iter()
-        .map(|item| IntervalResponse {
-            start_utc: item.start.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            duration_seconds: item.duration_seconds,
-            raw_value: item.raw_value,
-            meter_reading_id: item.meter_reading_id,
-            accepted_revision_id: item.accepted_revision_id,
-            power_of_ten_multiplier: item.power_of_ten_multiplier,
-            unit_of_measure: item.unit_of_measure,
-        })
+        .map(interval_response)
         .collect();
     Ok(Json(StreamResponse {
         physical_meter_id: id,
         flow: flow.as_str(),
+        resolution: resolution.as_str(),
         candidate_count: count,
         resolved: true,
         intervals,
@@ -632,6 +675,7 @@ fn parse_history_range(
         start: start.to_owned(),
         end: end.to_owned(),
         flow: FlowQuery::default(),
+        resolution: ResolutionQuery::default(),
     })
 }
 
@@ -893,7 +937,16 @@ async fn import_green_button(
 }
 
 /// The health probe reveals no database or customer information.
+/// Intervals are served at the utility's native resolution by default.
 pub fn router(pool: Pool<MySql>) -> Router {
+    router_with_resolution(pool, Resolution::Native)
+}
+
+/// Router whose `stream` and `window` default to `default_resolution`.
+pub fn router_with_resolution(
+    pool: Pool<MySql>,
+    default_resolution: Resolution,
+) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/meters", get(meters))
@@ -906,13 +959,21 @@ pub fn router(pool: Pool<MySql>) -> Router {
         .route("/v1/meters/{id}/validation", get(validation))
         .route("/v1/meters/{id}/window", get(window))
         .route("/v1/meters/{id}/history/plan", post(history_plan))
-        .with_state(AppState { pool })
+        .with_state(AppState { pool, default_resolution })
 }
 
 /// Enable Swagger UI only for explicitly opted-in development instances.
 /// Deployment must additionally bind to a loopback address.
 pub fn developer_router(pool: Pool<MySql>) -> Router {
-    router(pool).merge(
+    developer_router_with_resolution(pool, Resolution::Native)
+}
+
+/// Developer router with an explicit default resolution.
+pub fn developer_router_with_resolution(
+    pool: Pool<MySql>,
+    default_resolution: Resolution,
+) -> Router {
+    router_with_resolution(pool, default_resolution).merge(
         SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi()),
     )
 }

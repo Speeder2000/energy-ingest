@@ -21,6 +21,12 @@ All notable changes to this project will be documented in this file.
   export channel made its whole consumption stream unresolved; it is now
   excluded from consumption and served separately. Ambiguous (net)
   electricity flows are still reported as issues.
+- Hourly presentation: `stream` and `window` accept `?resolution=hour` to
+  sum sub-hour (for example 15-minute) readings into complete UTC hours;
+  incomplete hours are omitted, never estimated. `ENGY_API_DEFAULT_RESOLUTION`
+  sets the server default; the all-in-one image defaults to `hour`, because
+  the Home Assistant integration rejected 15-minute electricity data with
+  "Incompatible utility reading".
 - Solar export meters: `meter ensure CUSTODIAN 1 NAME --export` (or
   `ENGY_SOLAR_EXPORT_METER_NAME` in the all-in-one image) registers an
   export profile whose streams default to received energy. Automatic

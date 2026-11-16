@@ -65,9 +65,24 @@ async fn authenticated_window_contract() {
         assert_eq!(body["error"], "invalid_window");
     }
 
+    // Query values are validated before any meter lookup.
+    let (status, body) =
+        get(&pool, &format!("{valid}&resolution=15m"), Some(&issued.token))
+            .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_resolution");
+    let (status, body) =
+        get(&pool, &format!("{valid}&flow=net"), Some(&issued.token)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_flow");
+
     let (status, body) = get(&pool, &valid, Some(&issued.token)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"], "not_found");
+    let (status, _) =
+        get(&pool, &format!("{valid}&resolution=hour"), Some(&issued.token))
+            .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     assert!(revoke_api_client(&pool, issued.client_id).await.unwrap());
     let (status, body) = get(&pool, &valid, Some(&issued.token)).await;
