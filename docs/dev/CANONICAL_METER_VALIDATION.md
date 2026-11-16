@@ -14,7 +14,7 @@ through the same summary function for CLI and authenticated HTTP consumers.
 It does **not** alter how source readings are selected.
 
 - Rust: `summarize_meter_validation(meter_id, &resolution)`.
-- CLI: `energy-store-admin meter validate METER_ID`.
+- CLI: `energy-store-admin meter validate METER_ID [--flow received]`.
 - HTTP: `GET /v1/meters/{id}/validation` (bearer authentication required).
   API version 1 governs both HTTP requests and responses.
 
@@ -31,6 +31,28 @@ The CLI renders text; the API returns JSON. Both derive from the same
   produce fewer selected intervals than candidates.
 - `unresolved`: One or more validation issues remain. No selected
   intervals or usage totals are certified by this summary.
+
+### Flow (consumption and solar export)
+
+The CLI (`--flow`) and the `validation`, `stream`, `window` and
+`history/plan` endpoints (`?flow=`) accept a flow, and responses echo it.
+When no flow is given, the meter profile's own flow is used: a profile
+registered with `meter ensure ... --export` is a solar export meter and
+defaults to `received`; every other profile defaults to `delivered`.
+`GET /v1/meters` reports each profile's `flow`.
+
+- `delivered` (default): energy delivered from the grid. Gas is always
+  `delivered`.
+- `received`: electricity exported to the grid, for example by solar
+  panels on a net-metered (NEM) meter. Only electricity resources take part.
+
+Each flow resolves independently. Readings of the other known direction
+(ESPI `flowDirection` 1 or 19) are excluded from the stream and from its
+candidate count; they are not reported as issues. Ambiguous electricity
+flows, such as net (`flowDirection` 20), still raise
+`unsupported_electricity_flow` in both flows. An invalid flow returns
+`400 invalid_flow`. Delivered fingerprints are unchanged from before flows
+were introduced; received fingerprints are distinct.
 
 An empty stream is **not** a successful historical validation.
 A validation success is scoped to the observations currently attached;

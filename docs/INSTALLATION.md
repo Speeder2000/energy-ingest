@@ -10,6 +10,10 @@ installation is currently the validated production path.
 
 ## 1. Download, initialize, and verify
 
+On Unraid, or for a single container configured only through environment
+variables, follow [Install on Unraid](INSTALL_UNRAID.md) instead of this
+guide.
+
 Follow [Install on Linux](INSTALL_LINUX.md) first. That guide downloads the
 verified production release, initializes MariaDB and its schema, and runs
 verification. **Do not repeat setup after returning to this guide.**

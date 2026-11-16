@@ -2,7 +2,10 @@
 
 //! Deterministic unit-style coverage without a live database.
 
-use energy_store::{StreamCandidate, StreamIssueKind, resolve_candidates};
+use energy_store::{
+    EnergyFlow, StreamCandidate, StreamIssueKind, resolve_candidates,
+    resolve_flow_candidates,
+};
 use sqlx::types::chrono::NaiveDateTime;
 
 fn candidate(id: u64, hour: u32, duration: u32, value: i64) -> StreamCandidate {
@@ -163,28 +166,77 @@ fn empty_input_is_not_claimed_to_have_usage() {
 }
 
 #[test]
-fn reverse_export_is_not_considered_consumption() {
-    let mut export = candidate(2, 1, 3600, 900);
+fn export_channel_is_excluded_from_consumption() {
+    // A solar (NEM) meter reports delivered and received channels side by
+    // side. The export channel must not block or contaminate consumption.
+    let mut export = candidate(2, 0, 3600, 900);
     export.flow_direction = Some(19);
     let result = resolve_candidates(vec![candidate(1, 0, 3600, 400), export]);
-    assert!(result.intervals.is_empty());
-    assert_eq!(result.issues.len(), 1);
-    assert_eq!(
-        result.issues[0].kind,
-        StreamIssueKind::UnsupportedElectricityFlow
-    );
+    assert!(result.issues.is_empty());
+    assert_eq!(result.candidate_count, 1);
+    assert_eq!(result.intervals.len(), 1);
+    assert_eq!(result.intervals[0].raw_value, 400);
 }
 
 #[test]
-fn export_only_is_not_treated_as_consumption() {
+fn export_only_has_no_consumption_data() {
     let mut export = candidate(1, 0, 3600, 1200);
     export.flow_direction = Some(19);
     let result = resolve_candidates(vec![export]);
+    assert_eq!(result.candidate_count, 0);
     assert!(result.intervals.is_empty());
-    assert_eq!(
-        result.issues[0].kind,
-        StreamIssueKind::UnsupportedElectricityFlow
+    assert!(result.issues.is_empty());
+}
+
+#[test]
+fn received_flow_selects_only_export() {
+    let mut export = candidate(2, 0, 3600, 900);
+    export.flow_direction = Some(19);
+    let mut gas = candidate(3, 0, 3600, 50);
+    gas.commodity = Some(7);
+    let result = resolve_flow_candidates(
+        vec![candidate(1, 0, 3600, 400), export, gas],
+        EnergyFlow::Received,
     );
+    assert!(result.issues.is_empty());
+    assert_eq!(result.candidate_count, 1);
+    assert_eq!(result.intervals.len(), 1);
+    assert_eq!(result.intervals[0].raw_value, 900);
+    assert_eq!(result.intervals[0].meter_reading_id, 2);
+}
+
+#[test]
+fn received_flow_of_consumption_only_meter_is_empty() {
+    let result = resolve_flow_candidates(
+        vec![candidate(1, 0, 3600, 400)],
+        EnergyFlow::Received,
+    );
+    assert_eq!(result.candidate_count, 0);
+    assert!(result.intervals.is_empty());
+    assert!(result.issues.is_empty());
+}
+
+#[test]
+fn ambiguous_flow_blocks_both_directions() {
+    for flow in [EnergyFlow::Delivered, EnergyFlow::Received] {
+        let mut net = candidate(1, 0, 3600, 500);
+        net.flow_direction = Some(20);
+        let result = resolve_flow_candidates(vec![net], flow);
+        assert!(result.intervals.is_empty());
+        assert_eq!(
+            result.issues[0].kind,
+            StreamIssueKind::UnsupportedElectricityFlow
+        );
+    }
+}
+
+#[test]
+fn flow_identifiers_round_trip() {
+    for flow in [EnergyFlow::Delivered, EnergyFlow::Received] {
+        assert_eq!(EnergyFlow::parse(flow.as_str()), Some(flow));
+    }
+    assert_eq!(EnergyFlow::parse("net"), None);
+    assert_eq!(EnergyFlow::default(), EnergyFlow::Delivered);
 }
 
 #[test]

@@ -13,12 +13,13 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use energy_store::{
-    AcquisitionSourceId, AssociationError, AssociationOutcome, HistoryWindow,
-    MAX_WINDOW_CANDIDATES, StoreError, authenticate_api_token,
+    AcquisitionSourceId, AssociationError, AssociationOutcome, EnergyFlow,
+    HistoryWindow, MAX_WINDOW_CANDIDATES, StoreError, authenticate_api_token,
     create_ingestion_run, get_acquisition_source,
-    import_gb_document_atomic_with_hash, plan_history_refresh,
-    resolve_meter_window, resolve_physical_meter_stream,
-    summarize_meter_validation, window_fingerprint,
+    import_gb_document_atomic_with_hash, physical_meter_flow,
+    plan_history_refresh, resolve_meter_flow_window,
+    resolve_physical_meter_flow_stream, summarize_meter_flow_validation,
+    window_fingerprint,
 };
 use gb::parse_reader;
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,42 @@ type ApiError = (StatusCode, Json<ErrorBody>);
 
 fn failure(code: StatusCode, message: &'static str) -> ApiError {
     (code, Json(ErrorBody { error: message }))
+}
+
+/// Optional stream direction: `delivered` (consumption) or `received`
+/// (electricity exported to the grid, such as solar). Omitted means the
+/// meter's own flow, so a solar export meter serves export by default.
+#[derive(Deserialize, Default)]
+struct FlowQuery {
+    flow: Option<String>,
+}
+
+impl FlowQuery {
+    /// Validates the parameter without database access.
+    fn parse(&self) -> Result<Option<EnergyFlow>, ApiError> {
+        self.flow
+            .as_deref()
+            .map(|value| {
+                EnergyFlow::parse(value).ok_or_else(|| {
+                    failure(StatusCode::BAD_REQUEST, "invalid_flow")
+                })
+            })
+            .transpose()
+    }
+
+    /// The requested flow, or the meter's own flow when none is given.
+    async fn resolve(
+        &self,
+        pool: &Pool<MySql>,
+        meter: u64,
+    ) -> Result<EnergyFlow, ApiError> {
+        match self.parse()? {
+            Some(flow) => Ok(flow),
+            None => {
+                physical_meter_flow(pool, meter).await.map_err(store_failure)
+            }
+        }
+    }
 }
 
 fn store_failure(error: StoreError) -> ApiError {
@@ -70,11 +107,14 @@ async fn require_auth(
     }
 }
 
-#[derive(Serialize, ToSchema, sqlx::FromRow)]
+#[derive(Serialize, ToSchema)]
 struct Meter {
     id: u64,
     display_name: String,
     commodity: u32,
+    /// `delivered`, or `received` for a solar export meter. Its streams
+    /// default to this flow.
+    flow: &'static str,
 }
 
 #[utoipa::path(
@@ -95,13 +135,24 @@ async fn meters(
     headers: HeaderMap,
 ) -> Result<Json<Vec<Meter>>, ApiError> {
     require_auth(&state.pool, &headers).await?;
-    let items = sqlx::query_as::<_, Meter>(
-        "SELECT id, display_name, commodity \
+    let rows = sqlx::query_as::<_, (u64, String, u32, u32)>(
+        "SELECT id, display_name, commodity, flow_direction \
          FROM physical_meter ORDER BY id",
     )
     .fetch_all(&state.pool)
     .await
     .map_err(|_| failure(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))?;
+    let items = rows
+        .into_iter()
+        .map(|(id, display_name, commodity, code)| Meter {
+            id,
+            display_name,
+            commodity,
+            flow: EnergyFlow::from_flow_direction(code)
+                .unwrap_or_default()
+                .as_str(),
+        })
+        .collect();
     Ok(Json(items))
 }
 
@@ -292,6 +343,8 @@ struct IssueResponse {
 #[derive(Serialize, ToSchema)]
 struct StreamResponse {
     physical_meter_id: u64,
+    /// `delivered` (consumption) or `received` (export).
+    flow: &'static str,
     candidate_count: usize,
     resolved: bool,
     intervals: Vec<IntervalResponse>,
@@ -303,6 +356,8 @@ struct StreamResponse {
 #[derive(Serialize, ToSchema)]
 struct ValidationResponse {
     physical_meter_id: u64,
+    /// `delivered` (consumption) or `received` (export).
+    flow: &'static str,
     status: &'static str,
     candidate_count: usize,
     selected_interval_count: usize,
@@ -312,9 +367,11 @@ struct ValidationResponse {
 
 fn validation_response(
     summary: energy_store::MeterValidation,
+    flow: EnergyFlow,
 ) -> ValidationResponse {
     ValidationResponse {
         physical_meter_id: summary.physical_meter_id,
+        flow: flow.as_str(),
         status: summary.status.as_str(),
         candidate_count: summary.candidate_count,
         selected_interval_count: summary.selected_interval_count,
@@ -335,10 +392,16 @@ fn validation_response(
 #[utoipa::path(
     get,
     path = "/v1/meters/{id}/validation",
-    params(("id" = u64, Path, description = "Physical meter ID")),
+    params(
+        ("id" = u64, Path, description = "Physical meter ID"),
+        ("flow" = Option<String>, Query,
+         description = "`delivered` or `received` (export); \
+                        defaults to the meter's flow"),
+    ),
     responses(
         (status = 200, description = "Canonical validation summary",
          body = ValidationResponse),
+        (status = 400, description = "Invalid flow", body = ErrorBody),
         (status = 401, description = "Bearer token required",
          body = ErrorBody),
         (status = 404, description = "Meter not found", body = ErrorBody),
@@ -348,23 +411,31 @@ fn validation_response(
 async fn validation(
     State(state): State<AppState>,
     Path(id): Path<u64>,
+    Query(flow): Query<FlowQuery>,
     headers: HeaderMap,
 ) -> Result<Json<ValidationResponse>, ApiError> {
     require_auth(&state.pool, &headers).await?;
-    let resolution = resolve_physical_meter_stream(&state.pool, id)
+    let flow = flow.resolve(&state.pool, id).await?;
+    let resolution = resolve_physical_meter_flow_stream(&state.pool, id, flow)
         .await
         .map_err(store_failure)?;
-    let summary = summarize_meter_validation(id, &resolution);
-    Ok(Json(validation_response(summary)))
+    let summary = summarize_meter_flow_validation(id, flow, &resolution);
+    Ok(Json(validation_response(summary, flow)))
 }
 
 #[utoipa::path(
     get,
     path = "/v1/meters/{id}/stream",
-    params(("id" = u64, Path, description = "Physical meter ID")),
+    params(
+        ("id" = u64, Path, description = "Physical meter ID"),
+        ("flow" = Option<String>, Query,
+         description = "`delivered` or `received` (export); \
+                        defaults to the meter's flow"),
+    ),
     responses(
         (status = 200, description = "Selected intervals or conflicts",
          body = StreamResponse),
+        (status = 400, description = "Invalid flow", body = ErrorBody),
         (status = 401, description = "Invalid or absent bearer token",
          body = ErrorBody),
         (status = 404, description = "Meter not found", body = ErrorBody),
@@ -376,10 +447,12 @@ async fn validation(
 async fn stream(
     State(state): State<AppState>,
     Path(id): Path<u64>,
+    Query(flow): Query<FlowQuery>,
     headers: HeaderMap,
 ) -> Result<Json<StreamResponse>, ApiError> {
     require_auth(&state.pool, &headers).await?;
-    let selected = resolve_physical_meter_stream(&state.pool, id)
+    let flow = flow.resolve(&state.pool, id).await?;
+    let selected = resolve_physical_meter_flow_stream(&state.pool, id, flow)
         .await
         .map_err(store_failure)?;
     let resolved = selected.issues.is_empty();
@@ -407,6 +480,7 @@ async fn stream(
         .collect();
     Ok(Json(StreamResponse {
         physical_meter_id: id,
+        flow: flow.as_str(),
         candidate_count: selected.candidate_count,
         resolved,
         intervals,
@@ -420,6 +494,8 @@ async fn stream(
 struct WindowQuery {
     start: String,
     end: String,
+    #[serde(flatten)]
+    flow: FlowQuery,
 }
 
 fn parse_window(
@@ -449,10 +525,14 @@ fn parse_window(
         ("id" = u64, Path, description = "Physical meter ID"),
         ("start" = String, Query, description = "UTC start, inclusive"),
         ("end" = String, Query, description = "UTC end, exclusive"),
+        ("flow" = Option<String>, Query,
+         description = "`delivered` or `received` (export); \
+                        defaults to the meter's flow"),
     ),
     responses(
         (status = 200, description = "Resolved window", body = StreamResponse),
-        (status = 400, description = "Invalid UTC range", body = ErrorBody),
+        (status = 400, description = "Invalid UTC range or flow",
+         body = ErrorBody),
         (status = 401, description = "Bearer token required", body = ErrorBody),
         (status = 404, description = "Meter not found", body = ErrorBody),
         (status = 409, description = "Ambiguous observations", body = ErrorBody),
@@ -468,7 +548,8 @@ async fn window(
 ) -> Result<Json<StreamResponse>, ApiError> {
     require_auth(&state.pool, &headers).await?;
     let (start, end) = parse_window(&query)?;
-    let selected = resolve_meter_window(&state.pool, id, start, end)
+    let flow = query.flow.resolve(&state.pool, id).await?;
+    let selected = resolve_meter_flow_window(&state.pool, id, start, end, flow)
         .await
         .map_err(store_failure)?
         .ok_or_else(|| failure(StatusCode::NOT_FOUND, "not_found"))?;
@@ -495,6 +576,7 @@ async fn window(
         .collect();
     Ok(Json(StreamResponse {
         physical_meter_id: id,
+        flow: flow.as_str(),
         candidate_count: count,
         resolved: true,
         intervals,
@@ -546,7 +628,11 @@ fn parse_history_range(
     start: &str,
     end: &str,
 ) -> Result<(NaiveDateTime, NaiveDateTime), ApiError> {
-    parse_window(&WindowQuery { start: start.to_owned(), end: end.to_owned() })
+    parse_window(&WindowQuery {
+        start: start.to_owned(),
+        end: end.to_owned(),
+        flow: FlowQuery::default(),
+    })
 }
 
 /// Check the partition before performing any database work.
@@ -617,12 +703,18 @@ fn history_plan_response(
 #[utoipa::path(
     post,
     path = "/v1/meters/{id}/history/plan",
-    params(("id" = u64, Path, description = "Physical meter ID")),
+    params(
+        ("id" = u64, Path, description = "Physical meter ID"),
+        ("flow" = Option<String>, Query,
+         description = "`delivered` or `received` (export); \
+                        defaults to the meter's flow"),
+    ),
     request_body = HistoryPlanRequest,
     responses(
         (status = 200, description = "Actions for each date range",
          body = HistoryPlanResponse),
-        (status = 400, description = "Invalid date ranges", body = ErrorBody),
+        (status = 400, description = "Invalid date ranges or flow",
+         body = ErrorBody),
         (status = 401, description = "Bearer token required", body = ErrorBody),
         (status = 404, description = "Meter not found", body = ErrorBody),
         (status = 413, description = "Reduce range size", body = ErrorBody),
@@ -632,17 +724,24 @@ fn history_plan_response(
 async fn history_plan(
     State(state): State<AppState>,
     Path(id): Path<u64>,
+    Query(flow): Query<FlowQuery>,
     headers: HeaderMap,
     Json(request): Json<HistoryPlanRequest>,
 ) -> Result<Json<HistoryPlanResponse>, ApiError> {
     require_auth(&state.pool, &headers).await?;
     let (mut current, previous) = history_inputs(&request)?;
+    let flow = flow.resolve(&state.pool, id).await?;
     for range in &mut current {
-        let selected =
-            resolve_meter_window(&state.pool, id, range.start, range.end)
-                .await
-                .map_err(store_failure)?
-                .ok_or_else(|| failure(StatusCode::NOT_FOUND, "not_found"))?;
+        let selected = resolve_meter_flow_window(
+            &state.pool,
+            id,
+            range.start,
+            range.end,
+            flow,
+        )
+        .await
+        .map_err(store_failure)?
+        .ok_or_else(|| failure(StatusCode::NOT_FOUND, "not_found"))?;
         if selected.candidate_count > MAX_WINDOW_CANDIDATES as usize {
             return Err(failure(
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -834,8 +933,13 @@ mod validation_contract_tests {
                 other_interval_reading_id: Some(6),
             }],
         };
-        let summary = summarize_meter_validation(3, &resolution);
-        let response = validation_response(summary.clone());
+        let summary = summarize_meter_flow_validation(
+            3,
+            EnergyFlow::Delivered,
+            &resolution,
+        );
+        let response =
+            validation_response(summary.clone(), EnergyFlow::Delivered);
         assert_eq!(response.status, summary.status.as_str());
         assert_eq!(response.physical_meter_id, summary.physical_meter_id);
         assert_eq!(response.candidate_count, summary.candidate_count);

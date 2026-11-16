@@ -42,9 +42,11 @@ case "${1:-} ${2:-}" in
         user=root
         variable=ENGY_DB_ADMIN_URL
         ;;
-    'custodian create'|'source create'|'source list'|\
+    'custodian create'|'custodian ensure'|\
+    'source create'|'source list'|\
     'stream discover'|'stream analyze'|\
-    'meter create'|'meter create-auto'|'meter rename'|\
+    'meter create'|'meter create-auto'|'meter ensure'|\
+    'meter rename'|\
     'meter list'|'meter set-number'|'meter attach'|\
     'meter attach-compatible'|'meter resources'|\
     'api-token create'|'api-token list'|'api-token revoke')

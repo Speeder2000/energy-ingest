@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: MIT
+#
+# All-in-one (embedded MariaDB) image for Unraid.
+# Pull requests: build and smoke-test natively on amd64 and arm64.
+# main, release tags and manual runs: also publish to GHCR.
+name: Unraid all-in-one image
+on:
+  pull_request:
+    paths:
+      - 'docker/Dockerfile.unraid'
+      - 'docker/unraid/**'
+      - 'scripts/test-unraid-image.sh'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/unraid-image.yml'
+  push:
+    branches: [main]
+    tags: ['energy-ingest-v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: unraid-image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  IMAGE: ghcr.io/speeder2000/energy-ingest-unraid
+  # Publish only from the Speeder2000 repository; never from forks or PRs.
+  PUBLISH: ${{ github.event_name != 'pull_request' && github.repository_owner == 'Speeder2000' }}
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v4
+      - name: Build image (native ${{ matrix.arch }})
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./docker/Dockerfile.unraid
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: energy-ingest-unraid:test
+          cache-from: type=gha,scope=unraid-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=unraid-${{ matrix.arch }}
+      - name: Smoke test with sanitized fixtures
+        run: bash scripts/test-unraid-image.sh energy-ingest-unraid:test
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push by digest
+        id: push
+        if: env.PUBLISH == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./docker/Dockerfile.unraid
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=unraid-${{ matrix.arch }}
+          provenance: mode=min
+      - name: Record digest
+        if: env.PUBLISH == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        if: env.PUBLISH == 'true'
+        with:
+          name: unraid-digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    if: github.event_name != 'pull_request' && github.repository_owner == 'Speeder2000'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: unraid-digest-*
+          merge-multiple: true
+          path: digests
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create multi-arch manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          tags=(-t "$IMAGE:sha-${GITHUB_SHA:0:12}")
+          if [[ "$GITHUB_REF" == refs/tags/energy-ingest-v* ]]; then
+            version="${GITHUB_REF_NAME#energy-ingest-v}"
+            [[ "$version" == "$(<release/VERSION)" ]] || {
+              echo 'ERROR: tag differs from release/VERSION' >&2
+              exit 1
+            }
+            tags+=(-t "$IMAGE:$version")
+          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            tags+=(-t "$IMAGE:latest")
+          fi
+          cd digests
+          docker buildx imagetools create "${tags[@]}" \
+            $(printf "$IMAGE@sha256:%s " *)
+      - name: Verify platforms
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$IMAGE:sha-${GITHUB_SHA:0:12}"
+          docker buildx imagetools inspect "$ref" | tee manifest.txt
+          grep -q 'linux/amd64' manifest.txt
+          grep -q 'linux/arm64' manifest.txt
+          echo "[OK] Published $ref (linux/amd64, linux/arm64)" \
+            >> "$GITHUB_STEP_SUMMARY"

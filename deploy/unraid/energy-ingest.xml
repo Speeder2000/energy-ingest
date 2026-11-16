@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<!-- SPDX-License-Identifier: MIT -->
+<Container version="2">
+  <Name>energy-ingest</Name>
+  <Repository>ghcr.io/speeder2000/energy-ingest-unraid:latest</Repository>
+  <Registry>https://github.com/Speeder2000/energy-ingest/pkgs/container/energy-ingest-unraid</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/Speeder2000/energy-ingest/issues</Support>
+  <Project>https://github.com/Speeder2000/energy-ingest</Project>
+  <Overview>Imports Green Button utility XML (electricity and natural gas, including solar/NEM exports) into an embedded MariaDB database and serves it to Home Assistant through an authenticated local API. Drop XML files into the imports folder; they are imported and matched to your meters automatically. The Home Assistant API token is generated on first start at /config/secrets/api_token. Keep port 8080 on your LAN only.</Overview>
+  <Category>HomeAutomation: Tools:</Category>
+  <WebUI/>
+  <TemplateURL>https://raw.githubusercontent.com/Speeder2000/energy-ingest/main/deploy/unraid/energy-ingest.xml</TemplateURL>
+  <Icon/>
+  <ExtraParams>--stop-timeout=60</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <Requires>See docs/INSTALL_UNRAID.md. Allow up to 60 seconds to stop so the embedded database shuts down cleanly.</Requires>
+  <Config Name="API port" Target="8080" Default="8080" Mode="tcp" Description="Authenticated HTTP API used by Home Assistant. Do not forward this port from your router." Type="Port" Display="always" Required="true" Mask="false">8080</Config>
+  <Config Name="Appdata" Target="/config" Default="/mnt/user/appdata/energy-ingest" Mode="rw" Description="Database files, generated credentials, API token and import state. Back this up with the container stopped." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/energy-ingest</Config>
+  <Config Name="XML imports" Target="/imports" Default="/mnt/user/appdata/energy-ingest/imports" Mode="ro" Description="Drop Green Button *.xml exports here. Files are read, never modified." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/energy-ingest/imports</Config>
+  <Config Name="Utility name" Target="ENGY_UTILITY_NAME" Default="" Mode="" Description="Your utility, e.g. SDG&amp;E. Required for automatic import." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="Electric meter name" Target="ENGY_ELECTRIC_METER_NAME" Default="Home Electric" Mode="" Description="Friendly name for your electricity meter. Leave empty if you have none. For solar/NEM, grid consumption goes here; set the solar export meter to track energy sent back to the grid separately." Type="Variable" Display="always" Required="false" Mask="false">Home Electric</Config>
+  <Config Name="Electric meter number" Target="ENGY_ELECTRIC_METER_NUMBER" Default="" Mode="" Description="Optional utility meter number from your bill. Stored privately; never logged." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Solar export meter name" Target="ENGY_SOLAR_EXPORT_METER_NAME" Default="" Mode="" Description="Optional. For solar/NEM: a separate meter for electricity your panels send back to the grid. Use it as Return to grid in the Home Assistant Energy Dashboard. Leave empty without solar." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Gas meter name" Target="ENGY_GAS_METER_NAME" Default="Home Gas" Mode="" Description="Friendly name for your natural gas meter. Leave empty if you have none." Type="Variable" Display="always" Required="false" Mask="false">Home Gas</Config>
+  <Config Name="Gas meter number" Target="ENGY_GAS_METER_NUMBER" Default="" Mode="" Description="Optional utility meter number from your bill. Stored privately; never logged." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Time zone" Target="TZ" Default="America/Los_Angeles" Mode="" Description="Your utility's time zone. Natural gas daily totals use it." Type="Variable" Display="always" Required="true" Mask="false">America/Los_Angeles</Config>
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User ID that owns appdata files and runs the database and API." Type="Variable" Display="advanced" Required="true" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group ID for appdata files." Type="Variable" Display="advanced" Required="true" Mask="false">100</Config>
+  <Config Name="Import source label" Target="ENGY_SOURCE_NAME" Default="Green Button Download" Mode="" Description="Label for how the XML is obtained." Type="Variable" Display="advanced" Required="false" Mask="false">Green Button Download</Config>
+  <Config Name="Automatic meter matching" Target="ENGY_AUTO_ATTACH" Default="true" Mode="" Description="Match imported data to the single configured meter of each type. Set false to match manually with engy-admin." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+  <Config Name="Import check interval" Target="ENGY_IMPORT_INTERVAL" Default="300" Mode="" Description="Seconds between checks of the imports folder (minimum 30)." Type="Variable" Display="advanced" Required="false" Mask="false">300</Config>
+</Container>

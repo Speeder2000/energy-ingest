@@ -19,7 +19,8 @@ pub enum AssociationError {
     Database,
 }
 
-/// Associates a resource only when its utility and commodity match.
+/// Associates a resource only when its utility and commodity match, and,
+/// for a solar export profile, only when the resource is export data.
 /// Locking the resource row serializes competing assignments, including
 /// assignments to different physical meters.
 pub async fn associate_meter_resource(
@@ -33,8 +34,8 @@ pub async fn associate_meter_resource(
     }
     let mut tx = pool.begin().await.map_err(|_| E::Database)?;
     // Lock the resource itself, not just an optional association row.
-    let resource: Option<(u64, Option<u32>)> = sqlx::query_as(
-        "SELECT src.data_custodian_id, rt.commodity \
+    let resource: Option<(u64, Option<u32>, Option<u32>)> = sqlx::query_as(
+        "SELECT src.data_custodian_id, rt.commodity, rt.flow_direction \
          FROM meter_reading mr \
          JOIN usage_point up ON up.id = mr.usage_point_id \
          JOIN acquisition_source src \
@@ -46,17 +47,25 @@ pub async fn associate_meter_resource(
     .fetch_optional(&mut *tx)
     .await
     .map_err(|_| E::Database)?;
-    let (custodian, commodity) = resource.ok_or(E::ResourceNotFound)?;
-    let meter: Option<(u64, u32)> = sqlx::query_as(
-        "SELECT data_custodian_id, commodity FROM physical_meter \
-         WHERE id = ?",
+    let (custodian, commodity, flow) = resource.ok_or(E::ResourceNotFound)?;
+    let meter: Option<(u64, u32, u32)> = sqlx::query_as(
+        "SELECT data_custodian_id, commodity, flow_direction \
+         FROM physical_meter WHERE id = ?",
     )
     .bind(meter_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|_| E::Database)?;
-    let (meter_custodian, meter_commodity) = meter.ok_or(E::MeterNotFound)?;
+    let (meter_custodian, meter_commodity, meter_flow) =
+        meter.ok_or(E::MeterNotFound)?;
     if custodian != meter_custodian || commodity != Some(meter_commodity) {
+        return Err(E::IdentityMismatch);
+    }
+    // A delivered profile may hold every channel of the meter (its export
+    // is then served with flow=received); an export profile holds only
+    // export, so its default stream is never consumption.
+    let export = crate::EnergyFlow::Received.flow_direction();
+    if meter_flow == export && flow != Some(export) {
         return Err(E::IdentityMismatch);
     }
     let current: Option<(u64,)> = sqlx::query_as(
