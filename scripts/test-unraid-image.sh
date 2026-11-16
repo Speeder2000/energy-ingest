@@ -75,6 +75,12 @@ docker image inspect "$IMAGE" >/dev/null || fail "image not found: $IMAGE"
 mkdir -p "$WORK/config" "$WORK/imports"
 cp "$FIXTURES/sdge-electric-one-day-hourly.xml" \
     "$FIXTURES/sdge-gas-one-day.xml" "$WORK/imports/"
+# Synthetic solar export channel: the hourly fixture's readings as a second
+# meter reading that uses the fixture's received (flowDirection 19) type.
+sed -e 's#MeterReading/01#MeterReading/02#g' \
+    -e 's#ReadingType/0701" rel="related"#ReadingType/0702" rel="related"#' \
+    "$FIXTURES/sdge-electric-one-day-hourly.xml" \
+    >"$WORK/imports/synthetic-electric-export.xml"
 # Older than the import loop's settle time so the first pass picks them up.
 touch -d '2 minutes ago' "$WORK/imports/"*.xml
 
@@ -85,6 +91,7 @@ docker run -d --name "$NAME" \
     -e ENGY_UTILITY_NAME='SDG&E (test)' \
     -e ENGY_ELECTRIC_METER_NAME='Home Electric' \
     -e ENGY_ELECTRIC_METER_NUMBER='TEST-ELECTRIC-0001' \
+    -e ENGY_SOLAR_EXPORT_METER_NAME='Home Solar Export' \
     -e ENGY_GAS_METER_NAME='Home Gas' \
     -e ENGY_IMPORT_INTERVAL=30 \
     -v "$WORK/config:/config" \
@@ -104,7 +111,10 @@ for _ in $(seq 1 40); do
     list="$(in_ctr engy-admin meter list 2>/dev/null || true)"
     electric="$(printf '%s\n' "$list" | awk '/Home Electric/ {print $NF}')"
     gas="$(printf '%s\n' "$list" | awk '/Home Gas/ {print $NF}')"
-    if [ "${electric:-0}" -gt 0 ] && [ "${gas:-0}" -gt 0 ]; then
+    export_count="$(printf '%s\n' "$list" |
+        awk '/Home Solar Export/ {print $NF}')"
+    if [ "${electric:-0}" -gt 0 ] && [ "${gas:-0}" -gt 0 ] &&
+        [ "${export_count:-0}" -gt 0 ]; then
         associated=true
         break
     fi
@@ -112,6 +122,24 @@ for _ in $(seq 1 40); do
 done
 [ "$associated" = true ] || fail "imports not associated: $list"
 pass 'folder import and automatic meter association'
+
+# Each electricity meter holds one direction and serves it by default.
+printf '%s\n' "$list" | grep -Eq 'Home Electric +Electricity +delivered +1$' ||
+    fail "consumption meter did not get exactly its channel: $list"
+printf '%s\n' "$list" |
+    grep -Eq 'Home Solar Export +Electricity +received +1$' ||
+    fail "export meter did not get exactly its channel: $list"
+export_id="$(printf '%s\n' "$list" | awk '/Home Solar Export/ {print $1}')"
+electric_id="$(printf '%s\n' "$list" | awk '/Home Electric/ {print $1}')"
+for meter in "$electric_id" "$export_id"; do
+    in_ctr engy-admin meter validate "$meter" | grep -qx 'Status: validated' ||
+        fail "meter $meter stream not validated"
+done
+in_ctr engy-admin meter validate "$export_id" | grep -qx 'Flow: received' ||
+    fail 'export meter does not default to received'
+[ "$(api_code "/v1/meters/$export_id/validation?flow=net" auth)" = 400 ] ||
+    fail 'invalid flow accepted'
+pass 'solar export meter matched and served as received by default'
 
 [ "$(proc_uid mariadbd)" = "$TEST_UID" ] || fail 'MariaDB runs as wrong UID'
 [ "$(proc_uid energy-api)" = "$TEST_UID" ] || fail 'API runs as wrong UID'
@@ -156,7 +184,7 @@ wait_healthy || fail 'container did not become healthy after restart'
 sleep 5
 [ "$(in_ctr wc -l /config/state/imported.sha256)" = "$imports_before" ] ||
     fail 'files were imported again after restart'
-[ "$(in_ctr engy-admin meter list | grep -c 'Home ')" = 2 ] ||
+[ "$(in_ctr engy-admin meter list | grep -c 'Home ')" = 3 ] ||
     fail 'meters duplicated after restart'
 pass 'restart preserves credentials, token, imports and meters'
 

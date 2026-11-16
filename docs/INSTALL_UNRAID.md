@@ -70,6 +70,7 @@ docker run -d --name energy-ingest \
 | `ENGY_SOURCE_NAME` | `Green Button Download` | Import source label. |
 | `ENGY_ELECTRIC_METER_NAME` | unset | Electricity meter. Solar (NEM) delivered and received channels both belong to this meter. |
 | `ENGY_ELECTRIC_METER_NUMBER` | unset | Optional utility meter number. Stored in the database; never logged. |
+| `ENGY_SOLAR_EXPORT_METER_NAME` | unset | Solar export meter, for electricity your panels send back to the grid. Requires `ENGY_ELECTRIC_METER_NAME`. See [Solar export](#solar-export). |
 | `ENGY_GAS_METER_NAME` | unset | Natural gas meter. |
 | `ENGY_GAS_METER_NUMBER` | unset | Optional utility meter number. |
 | `ENGY_AUTO_ATTACH` | `true` | Match imported data to the meter of the same type. |
@@ -92,12 +93,43 @@ records are not renamed.
 ### Meters
 
 This image assumes at most **one meter per type**: one electricity meter,
-including a combined solar/NEM meter, and one natural gas meter. With
+optionally one solar export meter, and one natural gas meter. With
 `ENGY_AUTO_ATTACH=true`, imported data is matched to the meter of the same
-type after each import. Matching is refused, with a log message, when more
-than one meter of a type is registered, or when data already belongs to
-another meter. Data of a type with no configured meter stays unmatched and
-does not appear in Home Assistant until you add that meter.
+type when the container starts and after each import. Matching is refused,
+with a log message, when more than one meter of a type is registered, or
+when data already belongs to another meter. Data of a type with no
+configured meter stays unmatched and does not appear in Home Assistant
+until you add that meter.
+
+### Solar export
+
+A solar (NEM) electricity meter reports two channels: energy taken from the
+grid and energy sent back to it. Without `ENGY_SOLAR_EXPORT_METER_NAME`,
+both channels belong to the electricity meter; Home Assistant receives
+consumption, and API clients can request export with `?flow=received`.
+
+Set `ENGY_SOLAR_EXPORT_METER_NAME`, for example `Home Solar Export`, to
+register export as its own meter. Each meter then serves one stream by
+default, so the Home Assistant integration imports export without changes.
+In Home Assistant's Energy Dashboard, choose the electricity meter for
+**Grid consumption** and the solar export meter for **Return to grid**.
+The export meter is labeled as electricity in the integration; it holds
+only exported energy.
+
+If export data was already imported to the electricity meter before you
+set the variable, the log shows a matching warning that names the IDs.
+Move the export data once, then restart the container:
+
+```bash
+docker exec energy-ingest engy-admin meter list
+docker exec energy-ingest engy-admin meter detach ELECTRIC_METER_ID RESOURCE_ID
+```
+
+To check either stream:
+
+```bash
+docker exec energy-ingest engy-admin meter validate METER_ID
+```
 
 ## Import Green Button XML
 
@@ -135,6 +167,7 @@ uses the restricted runtime account:
 docker exec energy-ingest engy-admin meter list
 docker exec energy-ingest engy-admin stream analyze --details
 docker exec energy-ingest engy-admin meter validate METER_ID
+docker exec energy-ingest engy-admin meter detach METER_ID RESOURCE_ID
 docker exec energy-ingest engy-admin api-token list
 docker exec energy-ingest engy-admin api-token create another-client
 ```

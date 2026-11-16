@@ -11,6 +11,77 @@ use chrono_tz::Tz;
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, MySql, Pool, types::chrono::NaiveDateTime};
 
+/// ESPI `flowDirection` for energy delivered from the grid to the customer.
+const FLOW_DELIVERED: u32 = 1;
+/// ESPI `flowDirection` for energy received from the customer (export).
+const FLOW_RECEIVED: u32 = 19;
+const COMMODITY_ELECTRICITY: u32 = 1;
+
+/// Which direction of an electricity meter's channels forms the stream.
+///
+/// A solar (NEM) meter reports grid consumption and grid export as
+/// separate resources. Each direction resolves as its own stream; the
+/// other known direction is excluded rather than treated as a conflict.
+/// Ambiguous electricity flows (net, absent) remain unresolved issues.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum EnergyFlow {
+    /// Grid consumption. Gas and other commodities are always delivered.
+    #[default]
+    Delivered,
+    /// Electricity exported to the grid, for example by solar panels.
+    Received,
+}
+
+impl EnergyFlow {
+    /// Machine-readable identifier shared by all presentation surfaces.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Received => "received",
+        }
+    }
+
+    /// Parses the identifier returned by [`EnergyFlow::as_str`].
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "delivered" => Some(Self::Delivered),
+            "received" => Some(Self::Received),
+            _ => None,
+        }
+    }
+
+    /// The ESPI `flowDirection` code this flow selects.
+    pub const fn flow_direction(self) -> u32 {
+        match self {
+            Self::Delivered => FLOW_DELIVERED,
+            Self::Received => FLOW_RECEIVED,
+        }
+    }
+
+    /// The flow for an ESPI `flowDirection` code, when it is one of ours.
+    pub const fn from_flow_direction(code: u32) -> Option<Self> {
+        match code {
+            FLOW_DELIVERED => Some(Self::Delivered),
+            FLOW_RECEIVED => Some(Self::Received),
+            _ => None,
+        }
+    }
+
+    /// Whether a candidate belongs to this flow's stream at all.
+    fn includes(self, candidate: &StreamCandidate) -> bool {
+        let electricity = candidate.commodity == Some(COMMODITY_ELECTRICITY);
+        match self {
+            Self::Delivered => {
+                !(electricity
+                    && candidate.flow_direction == Some(FLOW_RECEIVED))
+            }
+            Self::Received => {
+                electricity && candidate.flow_direction != Some(FLOW_DELIVERED)
+            }
+        }
+    }
+}
+
 /// A source interval with its currently accepted revision and measurement type.
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct StreamCandidate {
@@ -130,6 +201,19 @@ pub fn summarize_meter_validation(
     physical_meter_id: u64,
     result: &StreamResolution,
 ) -> MeterValidation {
+    summarize_meter_flow_validation(
+        physical_meter_id,
+        EnergyFlow::Delivered,
+        result,
+    )
+}
+
+/// Validation facts for one flow of a physical meter.
+pub fn summarize_meter_flow_validation(
+    physical_meter_id: u64,
+    flow: EnergyFlow,
+    result: &StreamResolution,
+) -> MeterValidation {
     let status = if !result.issues.is_empty() {
         ValidationStatus::Unresolved
     } else if result.candidate_count == 0 {
@@ -142,7 +226,11 @@ pub fn summarize_meter_validation(
         status,
         candidate_count: result.candidate_count,
         selected_interval_count: result.intervals.len(),
-        content_fingerprint: validation_fingerprint(physical_meter_id, result),
+        content_fingerprint: flow_validation_fingerprint(
+            physical_meter_id,
+            flow,
+            result,
+        ),
         issues: result.issues.clone(),
     }
 }
@@ -152,12 +240,19 @@ pub fn summarize_meter_validation(
 /// Changes to accepted values, revision provenance, selected intervals, or
 /// validation issues change the digest. It must be read again to detect
 /// changes; concurrent database writes are not snapshot-isolated here.
-pub fn validation_fingerprint(
+///
+/// Delivered digests are unchanged from before flows were introduced, so
+/// existing consumers do not see a spurious change.
+fn flow_validation_fingerprint(
     physical_meter_id: u64,
+    flow: EnergyFlow,
     result: &StreamResolution,
 ) -> String {
     let mut hash = Sha256::new();
     hash.update(b"energy-ingest-meter-validation-v2\0");
+    if flow == EnergyFlow::Received {
+        hash.update(b"flow=received\0");
+    }
     hash.update(physical_meter_id.to_be_bytes());
     hash.update((result.candidate_count as u64).to_be_bytes());
     let mut intervals = result.intervals.clone();
@@ -194,6 +289,25 @@ pub fn validation_fingerprint(
     format!("{:x}", hash.finalize())
 }
 
+/// The flow a physical meter profile reports, used when none is requested.
+///
+/// A profile registered for solar export resolves as `Received`; every
+/// other profile resolves as `Delivered`.
+pub async fn physical_meter_flow(
+    pool: &Pool<MySql>,
+    physical_meter_id: u64,
+) -> Result<EnergyFlow, StoreError> {
+    let code: Option<u32> = sqlx::query_scalar(
+        "SELECT flow_direction FROM physical_meter WHERE id = ?",
+    )
+    .bind(physical_meter_id)
+    .fetch_optional(pool)
+    .await?;
+    let code = code.ok_or(StoreError::NotFound)?;
+    // The schema constrains the column to the two supported codes.
+    Ok(EnergyFlow::from_flow_direction(code).unwrap_or_default())
+}
+
 /// Loads accepted observations for explicitly attached resources.
 ///
 /// The query never joins rejected revisions and never mutates storage.
@@ -201,6 +315,20 @@ pub fn validation_fingerprint(
 pub async fn resolve_physical_meter_stream(
     pool: &Pool<MySql>,
     physical_meter_id: u64,
+) -> Result<StreamResolution, StoreError> {
+    resolve_physical_meter_flow_stream(
+        pool,
+        physical_meter_id,
+        EnergyFlow::Delivered,
+    )
+    .await
+}
+
+/// Loads one flow (consumption or export) of a physical meter's stream.
+pub async fn resolve_physical_meter_flow_stream(
+    pool: &Pool<MySql>,
+    physical_meter_id: u64,
+    flow: EnergyFlow,
 ) -> Result<StreamResolution, StoreError> {
     let exists: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM physical_meter WHERE id = ?")
@@ -241,7 +369,7 @@ pub async fn resolve_physical_meter_stream(
     .fetch_all(pool)
     .await?;
 
-    Ok(resolve_candidates_with_local_gas_zone(candidates))
+    Ok(resolve_candidates_with_local_gas_zone(candidates, flow))
 }
 
 /// Upper bound on candidates evaluated for one historical window.
@@ -258,6 +386,24 @@ pub async fn resolve_meter_window(
     physical_meter_id: u64,
     start: NaiveDateTime,
     end: NaiveDateTime,
+) -> Result<Option<StreamResolution>, StoreError> {
+    resolve_meter_flow_window(
+        pool,
+        physical_meter_id,
+        start,
+        end,
+        EnergyFlow::Delivered,
+    )
+    .await
+}
+
+/// Resolves one flow of a meter inside a half-open UTC window.
+pub async fn resolve_meter_flow_window(
+    pool: &Pool<MySql>,
+    physical_meter_id: u64,
+    start: NaiveDateTime,
+    end: NaiveDateTime,
+    flow: EnergyFlow,
 ) -> Result<Option<StreamResolution>, StoreError> {
     let exists: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM physical_meter WHERE id = ?")
@@ -292,6 +438,8 @@ pub async fn resolve_meter_window(
         WHERE pmr.physical_meter_id = ?
           AND ir.interval_start >= ?
           AND ir.interval_start < ?
+          AND NOT (rt.commodity <=> ? AND rt.flow_direction <=> ?)
+          AND (? = 0 OR rt.commodity <=> ?)
         ORDER BY ir.interval_start, ir.interval_duration_seconds,
                  ir.id
         LIMIT ?
@@ -300,6 +448,15 @@ pub async fn resolve_meter_window(
     .bind(physical_meter_id)
     .bind(start)
     .bind(end)
+    // Must match EnergyFlow::includes: drop the opposite known direction,
+    // and keep only electricity for export.
+    .bind(COMMODITY_ELECTRICITY)
+    .bind(match flow {
+        EnergyFlow::Delivered => FLOW_RECEIVED,
+        EnergyFlow::Received => FLOW_DELIVERED,
+    })
+    .bind(u8::from(flow == EnergyFlow::Received))
+    .bind(COMMODITY_ELECTRICITY)
     .bind(MAX_WINDOW_CANDIDATES + 1)
     .fetch_all(pool)
     .await?;
@@ -309,7 +466,7 @@ pub async fn resolve_meter_window(
             ..StreamResolution::default()
         }));
     }
-    Ok(Some(resolve_candidates_with_local_gas_zone(candidates)))
+    Ok(Some(resolve_candidates_with_local_gas_zone(candidates, flow)))
 }
 
 /// Selects exact duplicates once; refuses ambiguous or overlapping data.
@@ -320,7 +477,15 @@ pub async fn resolve_meter_window(
 pub fn resolve_candidates(
     candidates: Vec<StreamCandidate>,
 ) -> StreamResolution {
-    resolve_candidates_with_gas_zone(candidates, None)
+    resolve_flow_candidates(candidates, EnergyFlow::Delivered)
+}
+
+/// Resolve one flow of the candidates; the other known flow is ignored.
+pub fn resolve_flow_candidates(
+    candidates: Vec<StreamCandidate>,
+    flow: EnergyFlow,
+) -> StreamResolution {
+    resolve_candidates_with_reporting_day(candidates, flow, |_| None)
 }
 
 /// Resolve candidates with a verified daily gas time zone.
@@ -329,26 +494,37 @@ pub fn resolve_candidates_with_gas_zone(
     candidates: Vec<StreamCandidate>,
     gas_zone: Option<Tz>,
 ) -> StreamResolution {
-    resolve_candidates_with_reporting_day(candidates, |candidate| {
-        gas_zone.and_then(|zone| gas_reporting_day(candidate, zone))
-    })
+    resolve_candidates_with_reporting_day(
+        candidates,
+        EnergyFlow::Delivered,
+        |candidate| {
+            gas_zone.and_then(|zone| gas_reporting_day(candidate, zone))
+        },
+    )
 }
 
 /// Production uses the local time zone configured by the operating system.
 /// Docker mounts the host's /etc/localtime read-only into the API service.
 fn resolve_candidates_with_local_gas_zone(
     candidates: Vec<StreamCandidate>,
+    flow: EnergyFlow,
 ) -> StreamResolution {
-    resolve_candidates_with_reporting_day(candidates, gas_reporting_day_local)
+    resolve_candidates_with_reporting_day(
+        candidates,
+        flow,
+        gas_reporting_day_local,
+    )
 }
 
 fn resolve_candidates_with_reporting_day<F>(
     mut candidates: Vec<StreamCandidate>,
+    flow: EnergyFlow,
     reporting_day: F,
 ) -> StreamResolution
 where
     F: Fn(&StreamCandidate) -> Option<chrono::NaiveDate>,
 {
+    candidates.retain(|candidate| flow.includes(candidate));
     candidates.sort_by_key(|c| {
         (c.interval_start, c.interval_duration_seconds, c.interval_reading_id)
     });
@@ -414,9 +590,10 @@ where
             continue;
         };
         let metadata: [i64; 8] = metadata.try_into().expect("eight fields");
-        // Grid exports and ambiguous electricity flow are not consumption.
-        // Retain the raw observations in storage for a future export API.
-        if candidate.commodity == Some(1) && candidate.flow_direction != Some(1)
+        // Ambiguous electricity flow (net, unknown) is neither consumption
+        // nor export. The opposite known direction was excluded above.
+        if candidate.commodity == Some(COMMODITY_ELECTRICITY)
+            && candidate.flow_direction != Some(flow.flow_direction())
         {
             issue(
                 &mut result,
@@ -675,8 +852,12 @@ mod validation_contract_tests {
                 other_interval_reading_id: Some(41),
             }],
         };
-        let original = validation_fingerprint(1, &resolution);
+        let original =
+            flow_validation_fingerprint(1, EnergyFlow::Delivered, &resolution);
         resolution.issues[0].interval_reading_id = 43;
-        assert_ne!(original, validation_fingerprint(1, &resolution));
+        assert_ne!(
+            original,
+            flow_validation_fingerprint(1, EnergyFlow::Delivered, &resolution)
+        );
     }
 }

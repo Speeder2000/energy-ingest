@@ -199,18 +199,21 @@ unset admin_password app_password
 
 source_id=''
 electric_meter_id=''
+export_meter_id=''
 gas_meter_id=''
 
 id_from() {
     sed -n 's/.*id=\([0-9][0-9]*\).*/\1/p' | tail -n 1
 }
 
+# Optional sixth argument: --export for a solar export (grid return) meter.
 ensure_meter() {
     local custodian="$1" commodity="$2" label="$3" name="$4" number_var="$5"
-    local output meter number
+    local flag="${6:-}" output meter number
+    local -a args=("$custodian" "$commodity" "$name")
+    [ -z "$flag" ] || args+=("$flag")
 
-    output="$(engy_as_app energy-store-admin meter ensure \
-        "$custodian" "$commodity" "$name")" ||
+    output="$(engy_as_app energy-store-admin meter ensure "${args[@]}")" ||
         engy_die "could not register the $label meter"
     meter="$(printf '%s\n' "$output" | id_from)"
     [ -n "$meter" ] || engy_die "unexpected response registering $label meter"
@@ -243,6 +246,12 @@ if [ -n "${ENGY_UTILITY_NAME:-}" ]; then
     if [ -n "${ENGY_ELECTRIC_METER_NAME:-}" ]; then
         electric_meter_id="$(ensure_meter "$custodian_id" 1 Electricity \
             "$ENGY_ELECTRIC_METER_NAME" ENGY_ELECTRIC_METER_NUMBER)"
+    fi
+    if [ -n "${ENGY_SOLAR_EXPORT_METER_NAME:-}" ]; then
+        [ -n "${ENGY_ELECTRIC_METER_NAME:-}" ] ||
+            engy_die 'ENGY_SOLAR_EXPORT_METER_NAME requires ENGY_ELECTRIC_METER_NAME'
+        export_meter_id="$(ensure_meter "$custodian_id" 1 'Solar export' \
+            "$ENGY_SOLAR_EXPORT_METER_NAME" __unused__ --export)"
     fi
     if [ -n "${ENGY_GAS_METER_NAME:-}" ]; then
         gas_meter_id="$(ensure_meter "$custodian_id" 7 'Natural gas' \
@@ -323,7 +332,9 @@ fi
 if [ -n "$source_id" ] && [ -d "$ENGY_IMPORT_DIR" ]; then
     (
         export ENGY_RT_SOURCE_ID="$source_id"
-        export ENGY_RT_METER_IDS="$electric_meter_id $gas_meter_id"
+        # While an export meter exists, the consumption meter skips export
+        # data, so each takes its own channels regardless of order.
+        export ENGY_RT_METER_IDS="$electric_meter_id $export_meter_id $gas_meter_id"
         ENGY_DB_URL="$(engy_app_db_url)"
         export ENGY_DB_URL
         exec gosu "$ENGY_RUN_USER" /usr/local/bin/engy-import-loop

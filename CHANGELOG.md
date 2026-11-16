@@ -14,6 +14,21 @@ All notable changes to this project will be documented in this file.
   schema bootstrap, utility and meter registration, API token provisioning,
   folder-based XML import and automatic matching to one meter per type. See
   `docs/INSTALL_UNRAID.md` and the template in `deploy/unraid/`.
+- Solar export: the API `validation`, `stream`, `window` and
+  `history/plan` endpoints accept `?flow=received` to serve electricity
+  exported to the grid, and `meter validate` accepts `--flow received`.
+  Consumption remains the default. Previously, a net-metered (NEM) meter's
+  export channel made its whole consumption stream unresolved; it is now
+  excluded from consumption and served separately. Ambiguous (net)
+  electricity flows are still reported as issues.
+- Solar export meters: `meter ensure CUSTODIAN 1 NAME --export` (or
+  `ENGY_SOLAR_EXPORT_METER_NAME` in the all-in-one image) registers an
+  export profile whose streams default to received energy. Automatic
+  matching sends export data to it, so per-meter clients such as the Home
+  Assistant integration import solar export without changes.
+  `GET /v1/meters` reports each meter's `flow`. Adds migration 0009
+  (`physical_meter.flow_direction`) and `meter detach` for explicitly
+  moving data that was associated with the wrong meter.
 - Idempotent `custodian ensure` and `meter ensure` administration commands
   for unattended registration.
 

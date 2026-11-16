@@ -6,9 +6,10 @@
 //! separate from importing customer Green Button XML.
 
 use energy_store::{
-    DataCustodianId, create_acquisition_source, create_data_custodian,
-    get_data_custodian, get_source_by_name, resolve_physical_meter_stream,
-    summarize_meter_validation,
+    DataCustodianId, EnergyFlow, create_acquisition_source,
+    create_data_custodian, get_data_custodian, get_source_by_name,
+    physical_meter_flow, resolve_physical_meter_flow_stream,
+    summarize_meter_flow_validation,
 };
 use sqlx::mysql::MySqlPoolOptions;
 use std::{
@@ -28,14 +29,15 @@ Usage:
   energy-store-admin stream discover [--details]
   energy-store-admin meter create CUSTODIAN_ID COMMODITY NAME
   energy-store-admin meter create-auto COMMODITY NAME
-  energy-store-admin meter ensure CUSTODIAN_ID COMMODITY NAME
+  energy-store-admin meter ensure CUSTODIAN_ID COMMODITY NAME [--export]
   energy-store-admin meter set-number METER_ID --stdin
   energy-store-admin meter rename METER_ID NAME
   energy-store-admin meter list
   energy-store-admin meter attach METER_ID RESOURCE_ID
+  energy-store-admin meter detach METER_ID RESOURCE_ID
   energy-store-admin meter attach-compatible METER_ID [--apply]
   energy-store-admin meter resources METER_ID
-  energy-store-admin meter validate METER_ID
+  energy-store-admin meter validate METER_ID [--flow delivered|received]
   energy-store-admin --help
 
 Environment:
@@ -44,6 +46,8 @@ Environment:
 
 Notes:
   Names must be nonempty and at most 255 characters.
+  --export registers an electricity meter for solar export (grid return).
+  Its streams default to received energy, and it holds only export data.
   Verify the configured database before administrative operations.
   Registration does not require XML or customer account numbers.
 ";
@@ -59,14 +63,16 @@ enum Command {
     StreamAnalyze(bool),
     MeterCreate(u64, u32, String),
     MeterCreateAuto(u32, String),
-    MeterEnsure(u64, u32, String),
+    MeterEnsure(u64, u32, String, EnergyFlow),
     MeterRename(u64, String),
     MeterSetNumber(u64),
     MeterList,
     MeterAttach(u64, u64),
+    MeterDetach(u64, u64),
     MeterAttachCompatible(u64, bool),
     MeterResources(u64),
-    MeterValidate(u64),
+    /// `None` validates the meter's own flow.
+    MeterValidate(u64, Option<EnergyFlow>),
 }
 
 fn parse_id(value: &str) -> Result<u64, String> {
@@ -142,6 +148,23 @@ fn parse(args: &[String]) -> Result<Command, String> {
                 parse_id(id)?,
                 parse_commodity(commodity)?,
                 parse_name(name)?,
+                EnergyFlow::Delivered,
+            ))
+        }
+        [a, b, id, commodity, name, flag]
+            if a == "meter" && b == "ensure" && flag == "--export" =>
+        {
+            let commodity = parse_commodity(commodity)?;
+            if commodity != 1 {
+                return Err(
+                    "only an electricity meter can be an export meter".into()
+                );
+            }
+            Ok(Command::MeterEnsure(
+                parse_id(id)?,
+                commodity,
+                parse_name(name)?,
+                EnergyFlow::Received,
             ))
         }
         [a, b, id, flag]
@@ -156,6 +179,9 @@ fn parse(args: &[String]) -> Result<Command, String> {
         [a, b, meter, resource] if a == "meter" && b == "attach" => {
             Ok(Command::MeterAttach(parse_id(meter)?, parse_id(resource)?))
         }
+        [a, b, meter, resource] if a == "meter" && b == "detach" => {
+            Ok(Command::MeterDetach(parse_id(meter)?, parse_id(resource)?))
+        }
         [a, b, id] if a == "meter" && b == "attach-compatible" => {
             Ok(Command::MeterAttachCompatible(parse_id(id)?, false))
         }
@@ -167,7 +193,14 @@ fn parse(args: &[String]) -> Result<Command, String> {
             Ok(Command::MeterAttachCompatible(parse_id(id)?, true))
         }
         [a, b, id] if a == "meter" && b == "validate" => {
-            Ok(Command::MeterValidate(parse_id(id)?))
+            Ok(Command::MeterValidate(parse_id(id)?, None))
+        }
+        [a, b, id, flag, flow]
+            if a == "meter" && b == "validate" && flag == "--flow" =>
+        {
+            let flow = EnergyFlow::parse(flow)
+                .ok_or("flow must be delivered or received")?;
+            Ok(Command::MeterValidate(parse_id(id)?, Some(flow)))
         }
         [a, b, id] if a == "meter" && b == "resources" => {
             Ok(Command::MeterResources(parse_id(id)?))
@@ -348,8 +381,8 @@ async fn execute(args: &[String]) -> Result<(), String> {
                 result.last_insert_id()
             );
         }
-        Command::MeterEnsure(custodian, commodity, name) => {
-            meter_ensure(&pool, custodian, commodity, &name).await?;
+        Command::MeterEnsure(custodian, commodity, name, flow) => {
+            meter_ensure(&pool, custodian, commodity, &name, flow).await?;
         }
         Command::MeterSetNumber(meter) => {
             // Read privately via stdin, never from process arguments.
@@ -396,13 +429,14 @@ async fn execute(args: &[String]) -> Result<(), String> {
             println!("Meter profile renamed: {}", name);
         }
         Command::MeterList => {
-            let rows: Vec<(u64, String, u32, i64)> = sqlx::query_as(
+            let rows: Vec<(u64, String, u32, u32, i64)> = sqlx::query_as(
                 "SELECT p.id, p.display_name, p.commodity, \
-                     COUNT(a.meter_reading_id) \
+                     p.flow_direction, COUNT(a.meter_reading_id) \
                      FROM physical_meter p \
                      LEFT JOIN physical_meter_resource a \
                      ON a.physical_meter_id = p.id \
-                     GROUP BY p.id, p.display_name, p.commodity \
+                     GROUP BY p.id, p.display_name, p.commodity, \
+                     p.flow_direction \
                      ORDER BY p.id",
             )
             .fetch_all(&pool)
@@ -413,10 +447,15 @@ async fn execute(args: &[String]) -> Result<(), String> {
                 println!("Use meter-prod.sh create to add a meter.");
                 return Ok(());
             }
-            println!("ID  Name                    Commodity  Resources");
-            for (id, name, commodity, count) in rows {
+            println!(
+                "ID  Name                    Commodity   Flow      Resources"
+            );
+            for (id, name, commodity, code, count) in rows {
                 let kind = commodity_label(Some(commodity));
-                println!("{id:<3} {name:<23} {kind:<10} {count}");
+                let flow = EnergyFlow::from_flow_direction(code)
+                    .unwrap_or_default()
+                    .as_str();
+                println!("{id:<3} {name:<23} {kind:<11} {flow:<9} {count}");
             }
         }
         Command::MeterAttach(meter, resource) => {
@@ -435,7 +474,8 @@ async fn execute(args: &[String]) -> Result<(), String> {
                             "resource not found"
                         }
                         AssociationError::IdentityMismatch => {
-                            "utility or commodity mismatch"
+                            "utility, commodity or flow mismatch \
+                             (an export meter accepts only export data)"
                         }
                         AssociationError::AssignedElsewhere => {
                             "resource belongs to another meter profile"
@@ -451,14 +491,39 @@ async fn execute(args: &[String]) -> Result<(), String> {
                 }
             }
         }
+        Command::MeterDetach(meter, resource) => {
+            // Source observations are untouched; only the mapping is removed.
+            let result = sqlx::query(
+                "DELETE FROM physical_meter_resource \
+                 WHERE physical_meter_id = ? AND meter_reading_id = ?",
+            )
+            .bind(meter)
+            .bind(resource)
+            .execute(&pool)
+            .await
+            .map_err(|_| "resource detach failed")?;
+            if result.rows_affected() == 0 {
+                return Err(
+                    "resource is not associated with this meter profile".into(),
+                );
+            }
+            println!("Resource detached from meter profile.");
+        }
         Command::MeterAttachCompatible(meter, apply) => {
             attach_compatible(&pool, meter, apply).await?;
         }
-        Command::MeterValidate(meter) => {
-            let result = resolve_physical_meter_stream(&pool, meter)
+        Command::MeterValidate(meter, flow) => {
+            let flow = match flow {
+                Some(flow) => flow,
+                None => physical_meter_flow(&pool, meter)
+                    .await
+                    .map_err(|_| "meter profile not found")?,
+            };
+            let result = resolve_physical_meter_flow_stream(&pool, meter, flow)
                 .await
                 .map_err(|_| "meter validation failed")?;
-            let summary = summarize_meter_validation(meter, &result);
+            let summary = summarize_meter_flow_validation(meter, flow, &result);
+            println!("Flow: {}", flow.as_str());
             print!("{}", format_meter_validation(&summary));
         }
         Command::MeterResources(meter) => {
@@ -493,6 +558,7 @@ async fn meter_ensure(
     custodian: u64,
     commodity: u32,
     name: &str,
+    flow: EnergyFlow,
 ) -> Result<(), String> {
     let exists: Option<(u64,)> =
         sqlx::query_as("SELECT id FROM data_custodian WHERE id = ?")
@@ -503,8 +569,9 @@ async fn meter_ensure(
     if exists.is_none() {
         return Err("custodian does not exist".into());
     }
-    let existing: Option<(u64, u32)> = sqlx::query_as(
-        "SELECT id, commodity FROM physical_meter \
+    let flow_code = flow.flow_direction();
+    let existing: Option<(u64, u32, u32)> = sqlx::query_as(
+        "SELECT id, commodity, flow_direction FROM physical_meter \
          WHERE data_custodian_id = ? AND display_name = ?",
     )
     .bind(custodian)
@@ -513,21 +580,29 @@ async fn meter_ensure(
     .await
     .map_err(|_| "meter lookup failed")?;
     match existing {
-        Some((id, kind)) if kind == commodity => {
+        Some((id, kind, code)) if kind == commodity && code == flow_code => {
             println!("Meter profile already exists: id={id}");
         }
-        Some(_) => {
+        Some((_, kind, _)) if kind != commodity => {
             return Err("a meter with this name has another commodity".into());
+        }
+        Some(_) => {
+            // Never silently turn a consumption meter into an export meter.
+            return Err("a meter with this name has another flow \
+                 (consumption or export); choose another name"
+                .into());
         }
         None => {
             let result = sqlx::query(
                 "INSERT INTO physical_meter \
-                 (data_custodian_id, display_name, commodity) \
-                 VALUES (?, ?, ?)",
+                 (data_custodian_id, display_name, commodity, \
+                  flow_direction) \
+                 VALUES (?, ?, ?, ?)",
             )
             .bind(custodian)
             .bind(name)
             .bind(commodity)
+            .bind(flow_code)
             .execute(pool)
             .await
             .map_err(|_| "meter creation failed; check name")?;
@@ -565,7 +640,12 @@ fn format_meter_validation(summary: &energy_store::MeterValidation) -> String {
 ///
 /// This operation never infers that matching readings identify a physical
 /// meter. It is available only when the utility has a single profile for
-/// the chosen commodity. Multiple profiles require explicit associations.
+/// the chosen commodity and flow. Multiple profiles require explicit
+/// associations.
+///
+/// A solar export profile takes only export (received) electricity. While
+/// one exists, the consumption profile skips export resources; without one,
+/// the consumption profile takes every electricity resource, as before.
 async fn attach_compatible(
     pool: &sqlx::MySqlPool,
     meter: u64,
@@ -573,36 +653,39 @@ async fn attach_compatible(
 ) -> Result<(), String> {
     let mut tx =
         pool.begin().await.map_err(|_| "database transaction failed")?;
-    let profile: Option<(u64, u32, String)> = sqlx::query_as(
-        "SELECT data_custodian_id, commodity, display_name \
+    let profile: Option<(u64, u32, String, u32)> = sqlx::query_as(
+        "SELECT data_custodian_id, commodity, display_name, flow_direction \
          FROM physical_meter WHERE id = ? FOR UPDATE",
     )
     .bind(meter)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|_| "meter lookup failed")?;
-    let (custodian, kind, name) = profile.ok_or("meter profile not found")?;
+    let (custodian, kind, name, meter_flow) =
+        profile.ok_or("meter profile not found")?;
+    let export = EnergyFlow::Received.flow_direction();
 
-    let profiles: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM physical_meter \
+    let profiles: Vec<(u32,)> = sqlx::query_as(
+        "SELECT flow_direction FROM physical_meter \
          WHERE data_custodian_id = ? AND commodity = ?",
     )
     .bind(custodian)
     .bind(kind)
-    .fetch_one(&mut *tx)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|_| "meter profile count failed")?;
-    if profiles.0 != 1 {
-        return Err("multiple meters share this utility and commodity; \
-             associate resources individually"
+    if profiles.iter().filter(|(code,)| *code == meter_flow).count() != 1 {
+        return Err("multiple meters share this utility, commodity and \
+             flow; associate resources individually"
             .into());
     }
+    let export_profile_exists = profiles.iter().any(|(code,)| *code == export);
 
     // Resource associations are never inferred from interval values.
     // Restrict candidates to the same utility and commodity, then reject
     // assignments already owned by a different physical meter profile.
-    let resources: Vec<(u64, Option<u64>)> = sqlx::query_as(
-        "SELECT mr.id, pmr.physical_meter_id \
+    let resources: Vec<(u64, Option<u64>, Option<u32>)> = sqlx::query_as(
+        "SELECT mr.id, pmr.physical_meter_id, rt.flow_direction \
          FROM meter_reading mr \
          JOIN usage_point up ON up.id = mr.usage_point_id \
          JOIN acquisition_source src \
@@ -621,14 +704,28 @@ async fn attach_compatible(
 
     let mut pending = Vec::new();
     let mut existing = 0_usize;
-    for (id, owner) in resources {
+    for (id, owner, flow) in resources {
+        let is_export = flow == Some(export);
+        let wanted = if meter_flow == export {
+            is_export
+        } else {
+            !(export_profile_exists && is_export)
+        };
+        if !wanted {
+            continue;
+        }
         match owner {
             None => pending.push(id),
             Some(owner) if owner == meter => existing += 1,
-            Some(_) => {
-                return Err("a compatible resource belongs to another meter; \
-                 no associations were changed"
-                    .into());
+            Some(owner) => {
+                return Err(format!(
+                    "compatible resource {id} belongs to meter {owner}; \
+                     no associations were changed. If it is solar export \
+                     data on the consumption meter, run \
+                     'meter detach {owner} {id}', then \
+                     'meter attach-compatible {meter} --apply' or \
+                     restart the container."
+                ));
             }
         }
     }
@@ -966,7 +1063,14 @@ mod tests {
     fn canonical_meter_validation_command() {
         assert_eq!(
             parse(&args(&["meter", "validate", "5"])),
-            Ok(Command::MeterValidate(5))
+            Ok(Command::MeterValidate(5, None))
+        );
+        assert_eq!(
+            parse(&args(&["meter", "validate", "5", "--flow", "received"])),
+            Ok(Command::MeterValidate(5, Some(super::EnergyFlow::Received)))
+        );
+        assert!(
+            parse(&args(&["meter", "validate", "5", "--flow", "net"])).is_err()
         );
         assert!(parse(&args(&["meter", "validate", "0"])).is_err());
         let summary = energy_store::summarize_meter_validation(
@@ -1017,10 +1121,34 @@ mod tests {
         assert!(parse(&args(&["custodian", "ensure", " "])).is_err());
         assert_eq!(
             parse(&args(&["meter", "ensure", "3", "7", "Home Gas"])),
-            Ok(Command::MeterEnsure(3, 7, "Home Gas".into()))
+            Ok(Command::MeterEnsure(
+                3,
+                7,
+                "Home Gas".into(),
+                super::EnergyFlow::Delivered
+            ))
         );
         assert!(parse(&args(&["meter", "ensure", "0", "1", "Bad"])).is_err());
         assert!(parse(&args(&["meter", "ensure", "1", "2", "Bad"])).is_err());
+        assert_eq!(
+            parse(&args(&["meter", "ensure", "3", "1", "Solar", "--export"])),
+            Ok(Command::MeterEnsure(
+                3,
+                1,
+                "Solar".into(),
+                super::EnergyFlow::Received
+            ))
+        );
+        // Gas has no export flow.
+        assert!(
+            parse(&args(&["meter", "ensure", "3", "7", "Gas", "--export"]))
+                .is_err()
+        );
+        assert_eq!(
+            parse(&args(&["meter", "detach", "2", "9"])),
+            Ok(Command::MeterDetach(2, 9))
+        );
+        assert!(parse(&args(&["meter", "detach", "2", "0"])).is_err());
     }
 
     #[test]

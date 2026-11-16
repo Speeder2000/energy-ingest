@@ -91,10 +91,13 @@ mod window_fingerprint;
 pub use window_fingerprint::window_fingerprint;
 
 pub use usage_stream::{
-    MAX_WINDOW_CANDIDATES, MeterValidation, SelectedInterval, StreamCandidate,
-    StreamIssue, StreamIssueKind, StreamResolution, ValidationStatus,
-    resolve_candidates, resolve_candidates_with_gas_zone, resolve_meter_window,
-    resolve_physical_meter_stream, summarize_meter_validation,
+    EnergyFlow, MAX_WINDOW_CANDIDATES, MeterValidation, SelectedInterval,
+    StreamCandidate, StreamIssue, StreamIssueKind, StreamResolution,
+    ValidationStatus, physical_meter_flow, resolve_candidates,
+    resolve_candidates_with_gas_zone, resolve_flow_candidates,
+    resolve_meter_flow_window, resolve_meter_window,
+    resolve_physical_meter_flow_stream, resolve_physical_meter_stream,
+    summarize_meter_flow_validation, summarize_meter_validation,
 };
 
 use sqlx::{MySql, Pool};

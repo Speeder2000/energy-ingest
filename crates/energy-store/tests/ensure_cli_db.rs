@@ -61,6 +61,56 @@ async fn ensure_commands_are_idempotent() {
         admin(&url, &["meter", "ensure", &custodian_arg, "7", "Electric"]);
     assert!(!ok);
 
+    // A solar export meter is a separate electricity profile.
+    let export_args =
+        ["meter", "ensure", &custodian_arg, "1", "Solar Export", "--export"];
+    let (ok, export_created) = admin(&url, &export_args);
+    assert!(ok);
+    assert!(export_created.starts_with("Meter profile created: id="));
+    let export = id_of(&export_created);
+    assert_ne!(export, meter);
+    let (ok, export_repeated) = admin(&url, &export_args);
+    assert!(ok);
+    assert_eq!(export, id_of(&export_repeated));
+    let flows: Vec<(u64, u32)> = sqlx::query_as(
+        "SELECT id, flow_direction FROM physical_meter \
+         WHERE data_custodian_id = ? ORDER BY id",
+    )
+    .bind(custodian)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(flows, vec![(meter, 1), (export, 19)]);
+    assert_eq!(
+        energy_store::physical_meter_flow(&pool, export).await.unwrap(),
+        energy_store::EnergyFlow::Received
+    );
+    assert_eq!(
+        energy_store::physical_meter_flow(&pool, meter).await.unwrap(),
+        energy_store::EnergyFlow::Delivered
+    );
+
+    // A name is never silently switched between consumption and export.
+    let (ok, _) = admin(
+        &url,
+        &["meter", "ensure", &custodian_arg, "1", "Electric", "--export"],
+    );
+    assert!(!ok);
+    let (ok, _) =
+        admin(&url, &["meter", "ensure", &custodian_arg, "1", "Solar Export"]);
+    assert!(!ok);
+
+    // The schema refuses an export flow for natural gas.
+    let gas_export = sqlx::query(
+        "INSERT INTO physical_meter \
+         (data_custodian_id, display_name, commodity, flow_direction) \
+         VALUES (?, 'Gas Export', 7, 19)",
+    )
+    .bind(custodian)
+    .execute(&pool)
+    .await;
+    assert!(gas_export.is_err());
+
     let count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM physical_meter WHERE data_custodian_id = ?",
     )
@@ -69,8 +119,9 @@ async fn ensure_commands_are_idempotent() {
     .await
     .unwrap();
 
-    sqlx::query("DELETE FROM physical_meter WHERE id = ?")
+    sqlx::query("DELETE FROM physical_meter WHERE id IN (?, ?)")
         .bind(meter)
+        .bind(export)
         .execute(&pool)
         .await
         .unwrap();
@@ -80,5 +131,5 @@ async fn ensure_commands_are_idempotent() {
         .await
         .unwrap();
 
-    assert_eq!(count.0, 1);
+    assert_eq!(count.0, 2);
 }
