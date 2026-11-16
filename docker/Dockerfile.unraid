@@ -1,0 +1,104 @@
+# SPDX-License-Identifier: MIT
+#
+# All-in-one image for Unraid and other single-container hosts.
+#
+# MariaDB runs inside the container, bound to 127.0.0.1 only. The read-only
+# HTTP API is the only published port. All persistent state (database files,
+# generated credentials, the API token and import bookkeeping) lives under
+# /config. Configuration is supplied through environment variables; no
+# interactive setup is required. See docs/INSTALL_UNRAID.md.
+
+ARG RUST_IMAGE=rust:1-bookworm
+# Same MariaDB release line as the Compose deployment (mariadb:lts).
+ARG MARIADB_IMAGE=mariadb:lts
+
+FROM ${RUST_IMAGE} AS builder
+
+WORKDIR /workspace
+
+COPY . .
+
+RUN cargo build \
+    --locked \
+    --release \
+    -p energy-store \
+    --bin energy-store-admin \
+    --bin energy-store-import \
+    --bin energy-api-token \
+    -p energy-api \
+    --bin energy-api
+
+FROM ${MARIADB_IMAGE}
+
+# The official MariaDB image already provides gosu, tzdata and the MariaDB
+# client and server tools. curl serves the health check; tini reaps
+# children and forwards signals so MariaDB can shut down cleanly.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/lib/mysql/* \
+    && mkdir -p /config /imports
+
+# The runtime UID/GID are adjusted at start-up from PUID/PGID
+# (Unraid convention: 99/100). Both MariaDB and the application run as this
+# unprivileged account; root is used only for start-up provisioning.
+RUN groupadd --non-unique --gid 10001 energy \
+    && useradd \
+        --non-unique \
+        --uid 10001 \
+        --gid energy \
+        --home-dir /config \
+        --no-create-home \
+        --shell /usr/sbin/nologin \
+        energy
+
+COPY --from=builder \
+    /workspace/target/release/energy-store-admin \
+    /workspace/target/release/energy-store-import \
+    /workspace/target/release/energy-api-token \
+    /workspace/target/release/energy-api \
+    /usr/local/bin/
+
+COPY docker/unraid/99-energy-ingest.cnf /etc/mysql/conf.d/99-energy-ingest.cnf
+COPY docker/unraid/engy-common.sh /usr/local/lib/energy-ingest/engy-common.sh
+COPY docker/unraid/entrypoint.sh /usr/local/bin/engy-aio-entrypoint
+COPY docker/unraid/import-loop.sh /usr/local/bin/engy-import-loop
+COPY docker/unraid/healthcheck.sh /usr/local/bin/engy-healthcheck
+COPY docker/unraid/engy-admin.sh /usr/local/bin/engy-admin
+
+RUN chmod 0644 \
+        /etc/mysql/conf.d/99-energy-ingest.cnf \
+        /usr/local/lib/energy-ingest/engy-common.sh \
+    && chmod 0755 \
+        /usr/local/bin/energy-store-admin \
+        /usr/local/bin/energy-store-import \
+        /usr/local/bin/energy-api-token \
+        /usr/local/bin/energy-api \
+        /usr/local/bin/engy-aio-entrypoint \
+        /usr/local/bin/engy-import-loop \
+        /usr/local/bin/engy-healthcheck \
+        /usr/local/bin/engy-admin
+
+ENV PUID=99 \
+    PGID=100 \
+    ENGY_API_PORT=8080 \
+    ENGY_DB_NAME=energy_ingest \
+    ENGY_DB_USER=energy_ingest \
+    ENGY_SOURCE_NAME="Green Button Download" \
+    ENGY_AUTO_ATTACH=true \
+    ENGY_IMPORT_INTERVAL=300 \
+    ENGY_API_CLIENT_NAME=home-assistant
+
+VOLUME ["/config", "/imports"]
+EXPOSE 8080
+
+# Generous start period: the first start initializes MariaDB.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+    CMD ["/usr/local/bin/engy-healthcheck"]
+
+# MariaDB needs time to flush InnoDB on stop; run with --stop-timeout=60.
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/engy-aio-entrypoint"]

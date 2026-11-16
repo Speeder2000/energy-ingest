@@ -21,12 +21,14 @@ const USAGE: &str = "\
 Usage:
   energy-store-admin database bootstrap
   energy-store-admin custodian create NAME
+  energy-store-admin custodian ensure NAME
   energy-store-admin source create CUSTODIAN_ID NAME
   energy-store-admin source list CUSTODIAN_ID
   energy-store-admin stream analyze [--details]
   energy-store-admin stream discover [--details]
   energy-store-admin meter create CUSTODIAN_ID COMMODITY NAME
   energy-store-admin meter create-auto COMMODITY NAME
+  energy-store-admin meter ensure CUSTODIAN_ID COMMODITY NAME
   energy-store-admin meter set-number METER_ID --stdin
   energy-store-admin meter rename METER_ID NAME
   energy-store-admin meter list
@@ -51,11 +53,13 @@ enum Command {
     Help,
     Bootstrap,
     CustodianCreate(String),
+    CustodianEnsure(String),
     SourceCreate(u64, String),
     SourceList(u64),
     StreamAnalyze(bool),
     MeterCreate(u64, u32, String),
     MeterCreateAuto(u32, String),
+    MeterEnsure(u64, u32, String),
     MeterRename(u64, String),
     MeterSetNumber(u64),
     MeterList,
@@ -86,12 +90,24 @@ fn parse_name(value: &str) -> Result<String, String> {
     Ok(trimmed.to_owned())
 }
 
+/// Accept only the supported electricity (1) and natural gas (7) codes.
+fn parse_commodity(value: &str) -> Result<u32, String> {
+    let kind = value.parse::<u32>().map_err(|_| "commodity must be numeric")?;
+    if kind != 1 && kind != 7 {
+        return Err("commodity must be 1 or 7".into());
+    }
+    Ok(kind)
+}
+
 fn parse(args: &[String]) -> Result<Command, String> {
     match args {
         [flag] if flag == "--help" || flag == "-h" => Ok(Command::Help),
         [a, b] if a == "database" && b == "bootstrap" => Ok(Command::Bootstrap),
         [a, b, name] if a == "custodian" && b == "create" => {
             Ok(Command::CustodianCreate(parse_name(name)?))
+        }
+        [a, b, name] if a == "custodian" && b == "ensure" => {
+            Ok(Command::CustodianEnsure(parse_name(name)?))
         }
         [a, b, id, name] if a == "source" && b == "create" => {
             Ok(Command::SourceCreate(parse_id(id)?, parse_name(name)?))
@@ -116,13 +132,17 @@ fn parse(args: &[String]) -> Result<Command, String> {
             Ok(Command::MeterCreate(parse_id(id)?, kind, parse_name(name)?))
         }
         [a, b, commodity, name] if a == "meter" && b == "create-auto" => {
-            let kind = commodity
-                .parse::<u32>()
-                .map_err(|_| "commodity must be numeric")?;
-            if kind != 1 && kind != 7 {
-                return Err("commodity must be 1 or 7".into());
-            }
-            Ok(Command::MeterCreateAuto(kind, parse_name(name)?))
+            Ok(Command::MeterCreateAuto(
+                parse_commodity(commodity)?,
+                parse_name(name)?,
+            ))
+        }
+        [a, b, id, commodity, name] if a == "meter" && b == "ensure" => {
+            Ok(Command::MeterEnsure(
+                parse_id(id)?,
+                parse_commodity(commodity)?,
+                parse_name(name)?,
+            ))
         }
         [a, b, id, flag]
             if a == "meter" && b == "set-number" && flag == "--stdin" =>
@@ -202,6 +222,23 @@ async fn execute(args: &[String]) -> Result<(), String> {
                 .await
                 .map_err(|e| e.to_string())?;
             println!("Custodian created: id={}", id.0);
+        }
+        Command::CustodianEnsure(name) => {
+            // Idempotent form for unattended startup; names are unique.
+            let existing: Option<(u64,)> =
+                sqlx::query_as("SELECT id FROM data_custodian WHERE name = ?")
+                    .bind(&name)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|_| "custodian lookup failed")?;
+            if let Some((id,)) = existing {
+                println!("Custodian already exists: id={id}");
+            } else {
+                let id = create_data_custodian(&pool, &name)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                println!("Custodian created: id={}", id.0);
+            }
         }
         Command::SourceCreate(custodian_id, name) => {
             let custodian = DataCustodianId(custodian_id);
@@ -310,6 +347,9 @@ async fn execute(args: &[String]) -> Result<(), String> {
                 name,
                 result.last_insert_id()
             );
+        }
+        Command::MeterEnsure(custodian, commodity, name) => {
+            meter_ensure(&pool, custodian, commodity, &name).await?;
         }
         Command::MeterSetNumber(meter) => {
             // Read privately via stdin, never from process arguments.
@@ -440,6 +480,59 @@ async fn execute(args: &[String]) -> Result<(), String> {
             analyze_streams(&pool, details).await?
         }
         Command::Help | Command::Bootstrap => unreachable!(),
+    }
+    Ok(())
+}
+
+/// Create a meter profile unless one with this name already exists.
+///
+/// An existing profile with a different commodity is a conflict, never a
+/// silent reuse, because resources are matched to profiles by commodity.
+async fn meter_ensure(
+    pool: &sqlx::MySqlPool,
+    custodian: u64,
+    commodity: u32,
+    name: &str,
+) -> Result<(), String> {
+    let exists: Option<(u64,)> =
+        sqlx::query_as("SELECT id FROM data_custodian WHERE id = ?")
+            .bind(custodian)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| "custodian lookup failed")?;
+    if exists.is_none() {
+        return Err("custodian does not exist".into());
+    }
+    let existing: Option<(u64, u32)> = sqlx::query_as(
+        "SELECT id, commodity FROM physical_meter \
+         WHERE data_custodian_id = ? AND display_name = ?",
+    )
+    .bind(custodian)
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| "meter lookup failed")?;
+    match existing {
+        Some((id, kind)) if kind == commodity => {
+            println!("Meter profile already exists: id={id}");
+        }
+        Some(_) => {
+            return Err("a meter with this name has another commodity".into());
+        }
+        None => {
+            let result = sqlx::query(
+                "INSERT INTO physical_meter \
+                 (data_custodian_id, display_name, commodity) \
+                 VALUES (?, ?, ?)",
+            )
+            .bind(custodian)
+            .bind(name)
+            .bind(commodity)
+            .execute(pool)
+            .await
+            .map_err(|_| "meter creation failed; check name")?;
+            println!("Meter profile created: id={}", result.last_insert_id());
+        }
     }
     Ok(())
 }
@@ -913,6 +1006,21 @@ mod tests {
             parse(&args(&["meter", "attach", "1", "2"])),
             Ok(Command::MeterAttach(1, 2))
         );
+    }
+
+    #[test]
+    fn ensure_commands_parse_and_validate() {
+        assert_eq!(
+            parse(&args(&["custodian", "ensure", "SDG&E"])),
+            Ok(Command::CustodianEnsure("SDG&E".into()))
+        );
+        assert!(parse(&args(&["custodian", "ensure", " "])).is_err());
+        assert_eq!(
+            parse(&args(&["meter", "ensure", "3", "7", "Home Gas"])),
+            Ok(Command::MeterEnsure(3, 7, "Home Gas".into()))
+        );
+        assert!(parse(&args(&["meter", "ensure", "0", "1", "Bad"])).is_err());
+        assert!(parse(&args(&["meter", "ensure", "1", "2", "Bad"])).is_err());
     }
 
     #[test]

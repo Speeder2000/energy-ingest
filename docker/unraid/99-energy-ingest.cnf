@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+# Embedded MariaDB for the all-in-one image. Never reachable from outside
+# the container: TCP is bound to loopback and port 3306 is not published.
+[mysqld]
+bind-address = 127.0.0.1
+port = 3306
+skip-name-resolve
+socket = /run/mysqld/mysqld.sock
+pid-file = /run/mysqld/mysqld.pid
+datadir = /config/mysql
+character-set-server = utf8mb4
+# Home-lab sized; the dataset is small.
+innodb_buffer_pool_size = 128M
+
+[client]
+socket = /run/mysqld/mysqld.sock

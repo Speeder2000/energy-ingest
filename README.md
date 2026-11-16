@@ -59,6 +59,9 @@ For installation, select the most recent stable
 - Image: `docker.io/pmelendez2/gb-energy-ingest:<release-version>`.
 - [Installation](docs/INSTALLATION.md) and
   [Linux setup](docs/INSTALL_LINUX.md).
+- Single container with embedded MariaDB for Unraid:
+  `ghcr.io/speeder2000/energy-ingest-unraid` —
+  [Unraid setup](docs/INSTALL_UNRAID.md).
 - [Published release evidence](docs/testing/RELEASE_0_1_0_VALIDATION.md).
 - [Production release checklist](docs/dev/PRODUCTION_RELEASE_CHECKLIST.md).
 

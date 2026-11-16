@@ -8,6 +8,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- All-in-one container image for Unraid (`docker/Dockerfile.unraid`,
+  published as `ghcr.io/speeder2000/energy-ingest-unraid` for amd64 and
+  arm64) with embedded MariaDB, environment-only configuration, automatic
+  schema bootstrap, utility and meter registration, API token provisioning,
+  folder-based XML import and automatic matching to one meter per type. See
+  `docs/INSTALL_UNRAID.md` and the template in `deploy/unraid/`.
+- Idempotent `custodian ensure` and `meter ensure` administration commands
+  for unattended registration.
+
 - Authenticated resource-association responses include the canonical
   Green Button commodity code, allowing clients to present only compatible
   physical meters without guessing from filenames or resource IDs.
