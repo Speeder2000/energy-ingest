@@ -473,7 +473,8 @@ pub async fn resolve_meter_flow_window(
 ///
 /// This intentionally does not resample hourly/daily/monthly sources,
 /// choose quality winners, or sum values across resource boundaries.
-/// A future policy must explicitly authorize those operations.
+/// Presentation as complete UTC hours is a separate, lossless step on the
+/// resolved result (`Resolution::Hour`); resolution itself is unchanged.
 pub fn resolve_candidates(
     candidates: Vec<StreamCandidate>,
 ) -> StreamResolution {

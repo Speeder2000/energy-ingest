@@ -77,6 +77,7 @@ docker run -d --name energy-ingest \
 | `ENGY_IMPORT_INTERVAL` | `300` | Seconds between checks of `/imports` (minimum 30). |
 | `ENGY_API_CLIENT_NAME` | `home-assistant` | Name recorded for the generated API token. |
 | `ENGY_API_PORT` | `8080` | API port inside the container. |
+| `ENGY_API_DEFAULT_RESOLUTION` | `hour` | `hour` sums 15-minute utility readings into complete hours, which the Home Assistant integration requires; an hour with a missing reading is left out, never estimated. `native` serves readings as supplied. Clients can override it per request with `?resolution=`. |
 | `ENGY_DB_NAME` / `ENGY_DB_USER` | `energy_ingest` | Embedded database and runtime account names. |
 | `ENGY_DB_PASSWORD`, `ENGY_DB_ADMIN_PASSWORD` | generated | Optional overrides. If you set them, the database account is updated to match on the next start. |
 

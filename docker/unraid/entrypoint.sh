@@ -74,6 +74,9 @@ ENGY_DB_NAME="${ENGY_DB_NAME:-energy_ingest}"
 ENGY_DB_USER="${ENGY_DB_USER:-energy_ingest}"
 ENGY_API_PORT="${ENGY_API_PORT:-8080}"
 ENGY_IMPORT_INTERVAL="${ENGY_IMPORT_INTERVAL:-300}"
+# Home Assistant statistics are hourly; 15-minute utility data is summed
+# into complete hours unless a client asks for native intervals.
+ENGY_API_DEFAULT_RESOLUTION="${ENGY_API_DEFAULT_RESOLUTION:-hour}"
 engy_require_identifier ENGY_DB_NAME "$ENGY_DB_NAME"
 engy_require_identifier ENGY_DB_USER "$ENGY_DB_USER"
 engy_require_identifier ENGY_DB_ADMIN_USER "$ENGY_DB_ADMIN_USER"
@@ -87,7 +90,12 @@ case "$ENGY_IMPORT_INTERVAL" in
 esac
 [ "$ENGY_IMPORT_INTERVAL" -ge 30 ] ||
     engy_die 'ENGY_IMPORT_INTERVAL must be at least 30 seconds'
+case "$ENGY_API_DEFAULT_RESOLUTION" in
+    native|hour) ;;
+    *) engy_die 'ENGY_API_DEFAULT_RESOLUTION must be "hour" or "native"' ;;
+esac
 export ENGY_DB_NAME ENGY_DB_USER ENGY_API_PORT ENGY_IMPORT_INTERVAL
+export ENGY_API_DEFAULT_RESOLUTION
 
 # --- Persistent storage -------------------------------------------------------
 

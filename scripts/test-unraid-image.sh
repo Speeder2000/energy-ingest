@@ -141,6 +141,20 @@ in_ctr engy-admin meter validate "$export_id" | grep -qx 'Flow: received' ||
     fail 'invalid flow accepted'
 pass 'solar export meter matched and served as received by default'
 
+# The image serves complete hours by default; native stays available.
+stream_json() {
+    in_ctr sh -c 'printf "Authorization: Bearer %s\n" \
+        "$(cat /config/secrets/api_token)" >/tmp/h && \
+        curl -s -H @/tmp/h "http://127.0.0.1:8080'"$1"'"; rm -f /tmp/h'
+}
+stream_json "/v1/meters/$electric_id/stream" | grep -q '"resolution":"hour"' ||
+    fail 'stream does not default to hourly resolution'
+stream_json "/v1/meters/$electric_id/stream?resolution=native" |
+    grep -q '"resolution":"native"' || fail 'native resolution unavailable'
+[ "$(api_code "/v1/meters/$electric_id/stream?resolution=15m" auth)" = 400 ] ||
+    fail 'invalid resolution accepted'
+pass 'hourly resolution by default; native on request'
+
 [ "$(proc_uid mariadbd)" = "$TEST_UID" ] || fail 'MariaDB runs as wrong UID'
 [ "$(proc_uid energy-api)" = "$TEST_UID" ] || fail 'API runs as wrong UID'
 owner="$(in_ctr stat -c %u:%g /config/mysql /config/secrets/api_token |
