@@ -81,6 +81,32 @@ fn utc(seconds: i64) -> Result<NaiveDateTime, GbImportError> {
         .ok_or(GbImportError::InvalidTimestamp)
 }
 
+/// Resolves the single Usage Point that a Meter Reading's `up` link names.
+///
+/// Some providers (e.g. SDG&E Net Energy Metering exports) repeat the same
+/// `UsagePoint` entry before each Meter Reading channel. Entries that share
+/// a canonical self-href (`external_id`) describe one resource and are
+/// coalesced. Matches with different self-hrefs, or repeated entries that
+/// disagree on stored attributes, remain ambiguous and are rejected.
+fn resolve_usage_point<'a>(
+    document: &'a GbDocument,
+    up_href: &str,
+) -> Result<&'a gb::UsagePointRecord, GbImportError> {
+    let mut usages = document
+        .usage_points
+        .iter()
+        .filter(|item| item.related_hrefs.iter().any(|href| href == up_href));
+    let usage = usages.next().ok_or(GbImportError::InvalidRelationships)?;
+    for other in usages {
+        if other.external_id != usage.external_id
+            || other.service_category_kind != usage.service_category_kind
+        {
+            return Err(GbImportError::InvalidRelationships);
+        }
+    }
+    Ok(usage)
+}
+
 /// Validates the complete supported GB relationship graph before writes.
 ///
 /// Every Meter Reading needs one matching Usage Point and Reading Type.
@@ -101,13 +127,7 @@ fn prepare(
             .up_href
             .as_deref()
             .ok_or(GbImportError::InvalidRelationships)?;
-        let mut usages = document.usage_points.iter().filter(|item| {
-            item.related_hrefs.iter().any(|href| href == up_href)
-        });
-        let usage = usages.next().ok_or(GbImportError::InvalidRelationships)?;
-        if usages.next().is_some() {
-            return Err(GbImportError::InvalidRelationships);
-        }
+        let usage = resolve_usage_point(document, up_href)?;
 
         let mut types = document
             .reading_types
@@ -515,6 +535,81 @@ mod tests {
                 }],
             }],
         };
+        assert!(matches!(
+            prepare(&doc),
+            Err(GbImportError::InvalidRelationships)
+        ));
+    }
+
+    fn nem_document(
+        second_usage_id: &str,
+        second_kind: Option<u32>,
+    ) -> GbDocument {
+        let usage = |id: &str, kind| gb::UsagePointRecord {
+            external_id: id.into(),
+            related_hrefs: vec!["meter-parent".into()],
+            service_category_kind: kind,
+        };
+        let reading_type = gb::ReadingTypeRecord {
+            external_id: "type".into(),
+            accumulation_behaviour: None,
+            commodity: None,
+            data_qualifier: None,
+            flow_direction: None,
+            kind: None,
+            phase: None,
+            power_of_ten_multiplier: None,
+            unit_of_measure: None,
+            interval_length_seconds: None,
+        };
+        GbDocument {
+            usage_points: vec![
+                usage("usage", None),
+                usage(second_usage_id, second_kind),
+            ],
+            reading_types: vec![reading_type],
+            meter_readings: vec![gb::MeterReadingRecord {
+                external_id: "meter".into(),
+                up_href: Some("meter-parent".into()),
+                related_hrefs: vec!["type".into(), "blocks".into()],
+            }],
+            interval_blocks: vec![gb::IntervalBlockRecord {
+                external_id: "block".into(),
+                up_href: "blocks".into(),
+                start_unix: 0,
+                duration_seconds: 3600,
+                published_unix: None,
+                updated_unix: None,
+                readings: vec![gb::IntervalReadingRecord {
+                    start_unix: 0,
+                    duration_seconds: 3600,
+                    value: 0,
+                    quality: None,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn coalesces_duplicate_usage_point_entries() {
+        let doc = nem_document("usage", None);
+        let prepared = prepare(&doc).expect("duplicates coalesce");
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].usage.external_id, "usage");
+    }
+
+    #[test]
+    fn rejects_distinct_usage_points_for_one_meter() {
+        let doc = nem_document("other-usage", None);
+        assert!(matches!(
+            prepare(&doc),
+            Err(GbImportError::InvalidRelationships)
+        ));
+    }
+
+    #[test]
+    fn rejects_conflicting_duplicate_usage_point_attributes() {
+        let doc = nem_document("usage", Some(0));
         assert!(matches!(
             prepare(&doc),
             Err(GbImportError::InvalidRelationships)
