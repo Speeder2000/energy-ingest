@@ -11,6 +11,9 @@ datadir = /config/mysql
 character-set-server = utf8mb4
 # Home-lab sized; the dataset is small.
 innodb_buffer_pool_size = 128M
+# Short-lived admin commands close without COM_QUIT; level 2 would log an
+# "Aborted connection" warning for each one.
+log_warnings = 1
 
 [client]
 socket = /run/mysqld/mysqld.sock

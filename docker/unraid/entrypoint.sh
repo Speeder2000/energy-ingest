@@ -269,7 +269,7 @@ api_pid=$!
 api_ready=false
 for _ in $(seq 1 60); do
     kill -0 "$api_pid" 2>/dev/null || break
-    if curl -fsS -o /dev/null --max-time 2 \
+    if curl -fs -o /dev/null --max-time 2 \
         "http://127.0.0.1:${ENGY_API_PORT}/healthz"; then
         api_ready=true
         break

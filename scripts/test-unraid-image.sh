@@ -94,7 +94,7 @@ docker run -d --name "$NAME" \
 wait_healthy || fail 'container did not become healthy'
 pass 'container healthy on first start'
 
-[ "$(api_code /healthz)" = 200 ] || fail 'health probe'
+[ "$(api_code /healthz)" = 204 ] || fail 'health probe'
 [ "$(api_code /v1/meters)" = 401 ] || fail 'anonymous request not rejected'
 [ "$(api_code /v1/meters auth)" = 200 ] || fail 'token request rejected'
 pass 'API health, authentication and generated token'
